@@ -150,20 +150,16 @@ function runSelfCheck({
     encoding: 'utf-8'
   });
 
-  if (result.status !== 0) {
-    console.log('Self-check failed to run container.');
-    if (result.stderr) console.log(result.stderr.trim());
-    return false;
-  }
-
   const stdout = result.stdout || '';
+  const stderr = result.stderr || '';
   const startMarker = '---DOTCLAW_OUTPUT_START---';
   const endMarker = '---DOTCLAW_OUTPUT_END---';
   const startIdx = stdout.indexOf(startMarker);
   const endIdx = stdout.indexOf(endMarker);
   if (startIdx === -1 || endIdx === -1) {
     console.log('Self-check output could not be parsed.');
-    console.log(stdout.trim());
+    if (stderr.trim()) console.log(stderr.trim());
+    if (stdout.trim()) console.log(stdout.trim());
     return false;
   }
 
@@ -172,12 +168,14 @@ function runSelfCheck({
     const payload = JSON.parse(jsonText);
     if (payload.status !== 'success') {
       console.log('Self-check reported error:', payload.error || 'unknown');
+      if (stderr.trim()) console.log(stderr.trim());
       return false;
     }
     console.log(payload.result || 'Self-check passed.');
     return true;
   } catch (err) {
     console.log('Self-check output parse error:', err instanceof Error ? err.message : String(err));
+    if (stderr.trim()) console.log(stderr.trim());
     return false;
   }
 }

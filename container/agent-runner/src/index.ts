@@ -284,6 +284,7 @@ async function main(): Promise<void> {
       return;
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      log(`Self-check failed: ${errorMessage}`);
       writeOutput({
         status: 'error',
         result: null,
