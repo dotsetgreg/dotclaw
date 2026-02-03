@@ -26,8 +26,10 @@ const logger = pino({
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
 
-// Initialize Telegram bot
-const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
+// Initialize Telegram bot with extended timeout for long-running agent tasks
+const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!, {
+  handlerTimeout: 300_000 // 5 minutes (default is 90 seconds)
+});
 
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
@@ -568,6 +570,11 @@ async function processTaskIpc(
 }
 
 function setupTelegramHandlers(): void {
+  // Global error handler to prevent crashes
+  telegrafBot.catch((err, ctx) => {
+    logger.error({ err, chatId: ctx?.chat?.id }, 'Unhandled Telegraf error');
+  });
+
   // Handle all text messages
   telegrafBot.on('message', async (ctx) => {
     if (!ctx.message || !('text' in ctx.message)) return;
