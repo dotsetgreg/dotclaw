@@ -58,7 +58,6 @@ function writeOutput(output: ContainerOutput): void {
 }
 
 async function runSelfCheck(params: {
-  openrouter: OpenRouter;
   model: string;
 }) {
   const details: string[] = [];
@@ -95,17 +94,43 @@ async function runSelfCheck(params: {
   fs.unlinkSync(ipcFile);
   details.push('ipc directory writable');
 
-  const response = await params.openrouter.callModel({
-    model: params.model,
-    instructions: 'Return exactly the string "OK".',
-    input: 'Self check',
-    maxOutputTokens: 8,
-    temperature: 0
-  });
-  const text = (await response.getText()).trim();
-  if (!text) {
-    throw new Error('OpenRouter call returned empty response');
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+    'Content-Type': 'application/json'
+  };
+  if (process.env.OPENROUTER_SITE_URL) {
+    headers['HTTP-Referer'] = process.env.OPENROUTER_SITE_URL;
   }
+  if (process.env.OPENROUTER_SITE_NAME) {
+    headers['X-Title'] = process.env.OPENROUTER_SITE_NAME;
+  }
+
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: params.model,
+      messages: [{ role: 'user', content: 'Return exactly the string "OK".' }],
+      max_tokens: 8,
+      temperature: 0
+    })
+  });
+
+  const bodyText = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenRouter HTTP ${response.status}: ${bodyText.slice(0, 500)}`);
+  }
+
+  try {
+    const data = JSON.parse(bodyText);
+    const content = data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text;
+    if (!content || !String(content).trim()) {
+      throw new Error('OpenRouter call returned empty response');
+    }
+  } catch (err) {
+    throw new Error(`OpenRouter response parse failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   details.push('openrouter call ok');
 
   return details;
@@ -275,7 +300,7 @@ async function main(): Promise<void> {
 
   if (process.env.DOTCLAW_SELF_CHECK === '1') {
     try {
-      const details = await runSelfCheck({ openrouter, model });
+      const details = await runSelfCheck({ model });
       writeOutput({
         status: 'success',
         result: `Self-check passed: ${details.join(', ')}`,
