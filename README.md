@@ -8,6 +8,7 @@ Personal OpenRouter-based assistant for Telegram. Each request runs inside an is
 - Containerized agent runtime with strict mounts
 - Long-term memory with embeddings and semantic search
 - Scheduled tasks (cron and one-off)
+- Background jobs for long-running work
 - Tool policies and daily budgets
 - Plugin tools and Autotune optimization
 - Prometheus-compatible metrics

@@ -16,7 +16,7 @@ import {
 
 // Load .env from the canonical location (~/.dotclaw/.env)
 dotenv.config({ path: ENV_PATH });
-import { RegisteredGroup, Session, NewMessage } from './types.js';
+import { RegisteredGroup, Session, BackgroundJobStatus } from './types.js';
 import {
   initDatabase,
   storeMessage,  getMessagesSinceCursor,
@@ -34,7 +34,15 @@ import {
   getTraceIdForMessage,
   recordUserFeedback
 } from './db.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { startSchedulerLoop, runTaskNow } from './task-scheduler.js';
+import {
+  startBackgroundJobLoop,
+  spawnBackgroundJob,
+  getBackgroundJobStatus,
+  listBackgroundJobsForGroup,
+  cancelBackgroundJob,
+  recordBackgroundJobUpdate
+} from './background-jobs.js';
 import type { ContainerOutput } from './container-protocol.js';
 import type { AgentContext } from './agent-context.js';
 import { loadJson, saveJson, isSafeGroupFolder } from './utils.js';
@@ -74,11 +82,6 @@ function buildTriggerRegex(pattern: string | undefined): RegExp | null {
   } catch {
     return null;
   }
-}
-
-function isPreemptedError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.toLowerCase().includes('preempt');
 }
 
 function buildAvailableGroupsSnapshot(): Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }> {
@@ -219,20 +222,6 @@ const PROGRESS_MESSAGES = runtime.host.progress.messages.length > 0
 const HEARTBEAT_ENABLED = runtime.host.heartbeat.enabled;
 const HEARTBEAT_INTERVAL_MS = runtime.host.heartbeat.intervalMs;
 const HEARTBEAT_GROUP_FOLDER = (runtime.host.heartbeat.groupFolder || MAIN_GROUP_FOLDER).trim() || MAIN_GROUP_FOLDER;
-const BACKGROUND_TASKS_ENABLED = runtime.host.backgroundTasks.enabled;
-const BACKGROUND_TRIGGER_REGEX = runtime.host.backgroundTasks.triggerRegex;
-const BACKGROUND_TRIGGER = buildTriggerRegex(BACKGROUND_TRIGGER_REGEX);
-const BACKGROUND_ACK_MESSAGE = runtime.host.backgroundTasks.ackMessage;
-const BACKGROUND_TOOL_DENY = runtime.host.backgroundTasks.toolDeny;
-const PREEMPT_ON_NEW_MESSAGE = runtime.host.backgroundTasks.preemptOnNewMessage;
-
-function shouldRunInBackground(content: string): boolean {
-  if (!BACKGROUND_TASKS_ENABLED) return false;
-  const trimmed = content.trim();
-  if (!trimmed) return false;
-  if (BACKGROUND_TRIGGER && BACKGROUND_TRIGGER.test(trimmed)) return true;
-  return false;
-}
 
 // Initialize Telegram bot with extended timeout for long-running agent tasks
 const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!, {
@@ -254,7 +243,6 @@ type QueueState = {
 };
 
 const messageQueues = new Map<string, QueueState>();
-const inFlightRuns = new Map<string, { controller: AbortController; runId: string }>();
 
 type TelegramStreamMode = 'off' | 'draft' | 'edit' | 'auto';
 
@@ -690,13 +678,6 @@ interface TelegramMessage {
 }
 
 function enqueueMessage(msg: TelegramMessage): void {
-  if (PREEMPT_ON_NEW_MESSAGE) {
-    const inFlight = inFlightRuns.get(msg.chatId);
-    if (inFlight && !inFlight.controller.signal.aborted) {
-      logger.warn({ chatId: msg.chatId }, 'Preempting in-flight agent run');
-      inFlight.controller.abort();
-    }
-  }
   const existing = messageQueues.get(msg.chatId);
   if (existing) {
     existing.pendingMessage = msg;
@@ -776,20 +757,7 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   const prompt = `<messages>
 ${lines.join('\n')}
 </messages>`;
-
   const lastMessage = missedMessages[missedMessages.length - 1];
-  if (lastMessage && shouldRunInBackground(lastMessage.content)) {
-    logger.info({ group: group.name }, 'Routing message to background task');
-    updateChatState(msg.chatId, lastMessage.timestamp, lastMessage.id);
-    await sendMessage(msg.chatId, BACKGROUND_ACK_MESSAGE, { messageThreadId: msg.messageThreadId });
-    void runBackgroundTask({
-      msg,
-      group,
-      prompt,
-      missedMessages
-    });
-    return true;
-  }
 
   const traceBase = createTraceBase({
     chatId: msg.chatId,
@@ -968,201 +936,6 @@ ${lines.join('\n')}
   }
 
   return true;
-}
-
-
-async function runBackgroundTask(params: {
-  msg: TelegramMessage;
-  group: RegisteredGroup;
-  prompt: string;
-  missedMessages: NewMessage[];
-}): Promise<void> {
-  const { msg, group, prompt, missedMessages } = params;
-  const traceBase = createTraceBase({
-    chatId: msg.chatId,
-    groupFolder: group.folder,
-    userId: msg.senderId,
-    inputText: prompt,
-    source: 'dotclaw-background'
-  });
-
-  const recallQuery = missedMessages.map(entry => entry.content).join('\n');
-
-  const runId = `bg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const abortController = new AbortController();
-  if (PREEMPT_ON_NEW_MESSAGE) {
-    inFlightRuns.set(msg.chatId, { controller: abortController, runId });
-  }
-
-  let output: ContainerOutput | null = null;
-  let context: AgentContext | null = null;
-  let errorMessage: string | null = null;
-
-  try {
-    const execution = await executeAgentRun({
-      group,
-      prompt,
-      chatJid: msg.chatId,
-      userId: msg.senderId,
-      userName: msg.senderName,
-      recallQuery: recallQuery || msg.content,
-      recallMaxResults: MEMORY_RECALL_MAX_RESULTS,
-      recallMaxTokens: MEMORY_RECALL_MAX_TOKENS,
-      toolDeny: BACKGROUND_TOOL_DENY,
-      sessionId: runId,
-      persistSession: false,
-      useGroupLock: false,
-      abortSignal: abortController.signal,
-      isBackgroundTask: true,
-      availableGroups: buildAvailableGroupsSnapshot()
-    });
-    output = execution.output;
-    context = execution.context;
-    if (output.status === 'error') {
-      errorMessage = output.error || 'Unknown error';
-    }
-  } catch (err) {
-    if (err instanceof AgentExecutionError) {
-      context = err.context;
-      errorMessage = err.message;
-    } else {
-      errorMessage = err instanceof Error ? err.message : String(err);
-    }
-    if (abortController.signal.aborted || isPreemptedError(err)) {
-      if (context) {
-        recordAgentTelemetry({
-          traceBase,
-          output,
-          context,
-          metricsSource: 'telegram',
-          toolAuditSource: 'background',
-          errorMessage: 'preempted'
-        });
-      } else {
-        writeTrace({
-          trace_id: traceBase.trace_id,
-          timestamp: traceBase.timestamp,
-          created_at: traceBase.created_at,
-          chat_id: traceBase.chat_id,
-          group_folder: traceBase.group_folder,
-          user_id: traceBase.user_id,
-          input_text: traceBase.input_text,
-          output_text: null,
-          model_id: 'unknown',
-          memory_recall: [],
-          error_code: 'preempted',
-          source: traceBase.source
-        });
-      }
-      logger.warn({ chatId: msg.chatId }, 'Background run preempted; skipping response');
-      return;
-    }
-    logger.error({ group: group.name, err }, 'Background agent error');
-  } finally {
-    if (PREEMPT_ON_NEW_MESSAGE) {
-      const current = inFlightRuns.get(msg.chatId);
-      if (current?.runId === runId) {
-        inFlightRuns.delete(msg.chatId);
-      }
-    }
-  }
-
-  if (!output) {
-    if (context) {
-      recordAgentTelemetry({
-        traceBase,
-        output: null,
-        context,
-        metricsSource: 'telegram',
-        toolAuditSource: 'background',
-        errorMessage: errorMessage || 'No output from background agent',
-        errorType: 'agent'
-      });
-    } else {
-      recordError('agent');
-      writeTrace({
-        trace_id: traceBase.trace_id,
-        timestamp: traceBase.timestamp,
-        created_at: traceBase.created_at,
-        chat_id: traceBase.chat_id,
-        group_folder: traceBase.group_folder,
-        user_id: traceBase.user_id,
-        input_text: traceBase.input_text,
-        output_text: null,
-        model_id: 'unknown',
-        memory_recall: [],
-        error_code: errorMessage || 'No output from background agent',
-        source: traceBase.source
-      });
-    }
-    return;
-  }
-
-  if (output.status === 'error') {
-    if (abortController.signal.aborted || isPreemptedError(output.error)) {
-      if (context) {
-        recordAgentTelemetry({
-          traceBase,
-          output,
-          context,
-          metricsSource: 'telegram',
-          toolAuditSource: 'background',
-          errorMessage: 'preempted'
-        });
-      }
-      logger.warn({ chatId: msg.chatId }, 'Background run preempted; skipping response');
-      return;
-    }
-    if (context) {
-      recordAgentTelemetry({
-        traceBase,
-        output,
-        context,
-        metricsSource: 'telegram',
-        toolAuditSource: 'background',
-        errorMessage: errorMessage || output.error || 'Unknown error',
-        errorType: 'agent'
-      });
-    }
-    logger.error({ group: group.name, error: output.error }, 'Background agent error');
-    const userMessage = humanizeError(errorMessage || output.error || 'Unknown error');
-    await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
-    return;
-  }
-
-  if (output.result && output.result.trim()) {
-    const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
-    // Link the sent message to the trace for feedback tracking
-    if (sendResult.messageId) {
-      try {
-        linkMessageToTrace(sendResult.messageId, msg.chatId, traceBase.trace_id);
-      } catch {
-        // Don't fail if linking fails
-      }
-    }
-  } else if (output.tool_calls && output.tool_calls.length > 0) {
-    await sendMessage(
-      msg.chatId,
-      'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
-      { messageThreadId: msg.messageThreadId }
-    );
-  } else {
-    await sendMessage(
-      msg.chatId,
-      "I wasn't able to generate a response this time. Please try again or rephrase your request.",
-      { messageThreadId: msg.messageThreadId }
-    );
-  }
-
-  if (context) {
-    recordAgentTelemetry({
-      traceBase,
-      output,
-      context,
-      metricsSource: 'telegram',
-      toolAuditSource: 'background'
-    });
-  }
 }
 
 
@@ -1781,6 +1554,140 @@ async function processRequestIpc(
         const groups = listRegisteredGroups();
         return { id: requestId, ok: true, result: { groups } };
       }
+      case 'run_task': {
+        const taskId = typeof payload.task_id === 'string' ? payload.task_id : '';
+        if (!taskId) {
+          return { id: requestId, ok: false, error: 'task_id is required.' };
+        }
+        const task = getTaskById(taskId);
+        if (!task) {
+          return { id: requestId, ok: false, error: 'Task not found.' };
+        }
+        if (!isMain && task.group_folder !== sourceGroup) {
+          return { id: requestId, ok: false, error: 'Unauthorized task run attempt.' };
+        }
+        const result = await runTaskNow(taskId, {
+          sendMessage: async (jid, text) => { await sendMessage(jid, text); },
+          registeredGroups: () => registeredGroups,
+          getSessions: () => sessions,
+          setSession: (groupFolder, sessionId) => { sessions[groupFolder] = sessionId; }
+        });
+        return {
+          id: requestId,
+          ok: result.ok,
+          result: { result: result.result ?? null },
+          error: result.ok ? undefined : result.error
+        };
+      }
+      case 'spawn_job': {
+        const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
+        if (!prompt) {
+          return { id: requestId, ok: false, error: 'prompt is required.' };
+        }
+        const targetGroup = (typeof payload.target_group === 'string' && isMain)
+          ? payload.target_group
+          : sourceGroup;
+        const groupEntry = Object.entries(registeredGroups).find(([, group]) => group.folder === targetGroup);
+        if (!groupEntry) {
+          return { id: requestId, ok: false, error: 'Target group not registered.' };
+        }
+        const [chatId, group] = groupEntry;
+        const result = spawnBackgroundJob({
+          prompt,
+          groupFolder: group.folder,
+          chatJid: chatId,
+          contextMode: (payload.context_mode === 'group' || payload.context_mode === 'isolated')
+            ? payload.context_mode
+            : undefined,
+          timeoutMs: typeof payload.timeout_ms === 'number' ? payload.timeout_ms : undefined,
+          maxToolSteps: typeof payload.max_tool_steps === 'number' ? payload.max_tool_steps : undefined,
+          toolAllow: Array.isArray(payload.tool_allow) ? payload.tool_allow as string[] : undefined,
+          toolDeny: Array.isArray(payload.tool_deny) ? payload.tool_deny as string[] : undefined,
+          modelOverride: typeof payload.model_override === 'string' ? payload.model_override : undefined,
+          priority: typeof payload.priority === 'number' ? payload.priority : undefined,
+          tags: Array.isArray(payload.tags) ? payload.tags as string[] : undefined,
+          parentTraceId: typeof payload.parent_trace_id === 'string' ? payload.parent_trace_id : undefined,
+          parentMessageId: typeof payload.parent_message_id === 'string' ? payload.parent_message_id : undefined
+        });
+        return {
+          id: requestId,
+          ok: result.ok,
+          result: result.ok ? { job_id: result.jobId } : undefined,
+          error: result.ok ? undefined : result.error
+        };
+      }
+      case 'job_status': {
+        const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
+        if (!jobId) {
+          return { id: requestId, ok: false, error: 'job_id is required.' };
+        }
+        const job = getBackgroundJobStatus(jobId);
+        if (!job) {
+          return { id: requestId, ok: false, error: 'Job not found.' };
+        }
+        if (!isMain && job.group_folder !== sourceGroup) {
+          return { id: requestId, ok: false, error: 'Unauthorized job status request.' };
+        }
+        return { id: requestId, ok: true, result: { job } };
+      }
+      case 'list_jobs': {
+        const targetGroup = (typeof payload.target_group === 'string' && isMain)
+          ? payload.target_group
+          : sourceGroup;
+        const statusRaw = typeof payload.status === 'string' ? payload.status : undefined;
+        const allowedStatuses: BackgroundJobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'timed_out'];
+        const status = statusRaw && allowedStatuses.includes(statusRaw as BackgroundJobStatus)
+          ? (statusRaw as BackgroundJobStatus)
+          : undefined;
+        const limit = typeof payload.limit === 'number' ? payload.limit : undefined;
+        const jobs = listBackgroundJobsForGroup({ groupFolder: targetGroup, status, limit });
+        return { id: requestId, ok: true, result: { jobs } };
+      }
+      case 'cancel_job': {
+        const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
+        if (!jobId) {
+          return { id: requestId, ok: false, error: 'job_id is required.' };
+        }
+        const job = getBackgroundJobStatus(jobId);
+        if (!job) {
+          return { id: requestId, ok: false, error: 'Job not found.' };
+        }
+        if (!isMain && job.group_folder !== sourceGroup) {
+          return { id: requestId, ok: false, error: 'Unauthorized job cancel attempt.' };
+        }
+        const result = cancelBackgroundJob(jobId);
+        return { id: requestId, ok: result.ok, error: result.error };
+      }
+      case 'job_update': {
+        const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
+        const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+        const levelRaw = typeof payload.level === 'string' ? payload.level : 'progress';
+        const allowedLevels = ['info', 'progress', 'warn', 'error'] as const;
+        type JobUpdateLevel = typeof allowedLevels[number];
+        const level: JobUpdateLevel = allowedLevels.includes(levelRaw as JobUpdateLevel)
+          ? (levelRaw as JobUpdateLevel)
+          : 'progress';
+        if (!jobId || !message) {
+          return { id: requestId, ok: false, error: 'job_id and message are required.' };
+        }
+        const job = getBackgroundJobStatus(jobId);
+        if (!job) {
+          return { id: requestId, ok: false, error: 'Job not found.' };
+        }
+        if (!isMain && job.group_folder !== sourceGroup) {
+          return { id: requestId, ok: false, error: 'Unauthorized job update attempt.' };
+        }
+        const result = recordBackgroundJobUpdate({
+          jobId,
+          level,
+          message,
+          data: typeof payload.data === 'object' && payload.data ? payload.data as Record<string, unknown> : undefined
+        });
+        if (result.ok && payload.notify === true && job.chat_jid) {
+          await sendMessage(job.chat_jid, `Background job ${job.id} update:\n\n${message}`);
+        }
+        return { id: requestId, ok: result.ok, error: result.error };
+      }
       default:
         return { id: requestId, ok: false, error: `Unknown request type: ${data.type}` };
     }
@@ -2280,6 +2187,15 @@ async function main(): Promise<void> {
       await sendMessage(jid, text);
     };
     startSchedulerLoop({
+      sendMessage: sendMessageForScheduler,
+      registeredGroups: () => registeredGroups,
+      getSessions: () => sessions,
+      setSession: (groupFolder, sessionId) => {
+        sessions[groupFolder] = sessionId;
+        setGroupSession(groupFolder, sessionId);
+      }
+    });
+    startBackgroundJobLoop({
       sendMessage: sendMessageForScheduler,
       registeredGroups: () => registeredGroups,
       getSessions: () => sessions,

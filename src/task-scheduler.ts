@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
-import { getDueTasks, updateTaskAfterRun, logTaskRun, getTaskById, updateTask } from './db.js';
+import { getDueTasks, updateTaskAfterRun, logTaskRun, getTaskById, updateTask, updateTaskRunStatsOnly } from './db.js';
 import { recordTaskRun, recordError, recordMessage } from './metrics.js';
 import { ScheduledTask, RegisteredGroup } from './types.js';
 import { GROUPS_DIR, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
@@ -86,7 +86,8 @@ ${task.prompt}` : task.prompt;
       persistSession: task.context_mode === 'group',
       onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
       isScheduledTask: true,
-      taskId: task.id
+      taskId: task.id,
+      useGroupLock: false
     });
     output = execution.output;
     context = execution.context;
@@ -190,6 +191,134 @@ ${task.prompt}` : task.prompt;
   if (scheduleError) {
     updateTask(task.id, { status: 'paused', next_run: null });
   }
+}
+
+export async function runTaskNow(taskId: string, deps: SchedulerDependencies): Promise<{ ok: boolean; result?: string | null; error?: string }> {
+  const task = getTaskById(taskId);
+  if (!task) {
+    return { ok: false, error: 'Task not found' };
+  }
+
+  const startTime = Date.now();
+  const groupDir = path.join(GROUPS_DIR, task.group_folder);
+  fs.mkdirSync(groupDir, { recursive: true });
+
+  logger.info({ taskId: task.id, group: task.group_folder }, 'Running task immediately');
+  recordMessage('scheduler');
+
+  const groups = deps.registeredGroups();
+  const group = Object.values(groups).find(g => g.folder === task.group_folder);
+  if (!group) {
+    const error = `Group not found: ${task.group_folder}`;
+    logger.error({ taskId: task.id, groupFolder: task.group_folder }, 'Group not found for task');
+    recordError('scheduler');
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: Date.now() - startTime,
+      status: 'error',
+      result: null,
+      error
+    });
+    recordTaskRun('error');
+    updateTaskRunStatsOnly(task.id, `Error: ${error}`, error);
+    return { ok: false, error };
+  }
+
+  let result: string | null = null;
+  let error: string | null = null;
+  let output: ContainerOutput | null = null;
+  let context: AgentContext | null = null;
+
+  const sessions = deps.getSessions();
+  const sessionId = task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+
+  const stateBlock = task.state_json ? `[TASK STATE]\n${task.state_json}\n` : '';
+  const taskPrompt = stateBlock ? `${stateBlock}\n${task.prompt}` : task.prompt;
+
+  const traceBase = createTraceBase({
+    chatId: task.chat_jid,
+    groupFolder: task.group_folder,
+    userId: null,
+    inputText: task.prompt,
+    source: 'dotclaw-manual-task'
+  });
+
+  try {
+    const execution = await executeAgentRun({
+      group,
+      prompt: taskPrompt,
+      chatJid: task.chat_jid,
+      userId: null,
+      recallQuery: task.prompt,
+      recallMaxResults: runtime.host.memory.recall.maxResults,
+      recallMaxTokens: runtime.host.memory.recall.maxTokens,
+      sessionId,
+      persistSession: task.context_mode === 'group',
+      onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
+      isScheduledTask: true,
+      taskId: task.id
+    });
+    output = execution.output;
+    context = execution.context;
+
+    if (output.status === 'error') {
+      error = output.error || 'Unknown error';
+    } else {
+      result = output.result;
+    }
+  } catch (err) {
+    if (err instanceof AgentExecutionError) {
+      context = err.context;
+      error = err.message;
+    } else {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    logger.error({ taskId: task.id, error }, 'Immediate task run failed');
+  }
+
+  if (context) {
+    recordAgentTelemetry({
+      traceBase,
+      output,
+      context,
+      metricsSource: 'scheduler',
+      toolAuditSource: 'scheduler',
+      errorMessage: error ?? undefined,
+      errorType: error ? 'scheduler' : undefined
+    });
+  } else if (error) {
+    recordError('scheduler');
+    writeTrace({
+      trace_id: traceBase.trace_id,
+      timestamp: traceBase.timestamp,
+      created_at: traceBase.created_at,
+      chat_id: traceBase.chat_id,
+      group_folder: traceBase.group_folder,
+      input_text: traceBase.input_text,
+      output_text: null,
+      model_id: 'unknown',
+      memory_recall: [],
+      error_code: error,
+      source: traceBase.source
+    });
+  }
+
+  const durationMs = Date.now() - startTime;
+  logTaskRun({
+    task_id: task.id,
+    run_at: new Date().toISOString(),
+    duration_ms: durationMs,
+    status: error ? 'error' : 'success',
+    result,
+    error
+  });
+  recordTaskRun(error ? 'error' : 'success');
+
+  const resultSummary = error ? `Error: ${error}` : (result ? result.slice(0, 200) : 'Completed');
+  updateTaskRunStatsOnly(task.id, resultSummary, error);
+
+  return { ok: !error, result, error: error ?? undefined };
 }
 
 

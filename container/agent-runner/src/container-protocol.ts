@@ -9,9 +9,12 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   isBackgroundTask?: boolean;
+  isBackgroundJob?: boolean;
   taskId?: string;
+  jobId?: string;
   userId?: string;
   userName?: string;
+  maxToolSteps?: number;
   memoryRecall?: string[];
   userProfile?: string | null;
   memoryStats?: {

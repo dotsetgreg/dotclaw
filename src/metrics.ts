@@ -32,6 +32,12 @@ const taskRunsTotal = new Counter({
   labelNames: ['status']
 });
 
+const backgroundJobRunsTotal = new Counter({
+  name: 'dotclaw_background_job_runs_total',
+  help: 'Total background job runs',
+  labelNames: ['status']
+});
+
 const tokensPromptTotal = new Counter({
   name: 'dotclaw_tokens_prompt_total',
   help: 'Total prompt tokens (estimated)',
@@ -78,6 +84,7 @@ registry.registerMetric(messagesTotal);
 registry.registerMetric(errorsTotal);
 registry.registerMetric(toolCallsTotal);
 registry.registerMetric(taskRunsTotal);
+registry.registerMetric(backgroundJobRunsTotal);
 registry.registerMetric(tokensPromptTotal);
 registry.registerMetric(tokensCompletionTotal);
 registry.registerMetric(costTotal);
@@ -100,6 +107,10 @@ export function recordToolCall(tool: string, ok: boolean): void {
 
 export function recordTaskRun(status: 'success' | 'error'): void {
   taskRunsTotal.inc({ status });
+}
+
+export function recordBackgroundJobRun(status: 'success' | 'error' | 'canceled' | 'timed_out'): void {
+  backgroundJobRunsTotal.inc({ status });
 }
 
 export function recordLatency(ms: number): void {

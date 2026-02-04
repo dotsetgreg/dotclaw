@@ -568,7 +568,7 @@ function removeContainerById(containerId: string, reason: string): void {
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  options?: { abortSignal?: AbortSignal }
+  options?: { abortSignal?: AbortSignal; timeoutMs?: number }
 ): Promise<ContainerOutput> {
   if (CONTAINER_MODE === 'daemon') {
     return runContainerAgentDaemon(group, input, options);
@@ -663,7 +663,7 @@ export async function runContainerAgent(
       }
     };
 
-    const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    const timeoutMs = options?.timeoutMs || group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     const timeout = setTimeout(() => {
       logger.error({ group: group.name }, 'Container timeout, killing');
       stopContainer('timeout');
@@ -844,7 +844,7 @@ export async function runContainerAgent(
 async function runContainerAgentDaemon(
   group: RegisteredGroup,
   input: ContainerInput,
-  options?: { abortSignal?: AbortSignal }
+  options?: { abortSignal?: AbortSignal; timeoutMs?: number }
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
   const groupDir = path.join(GROUPS_DIR, group.folder);
@@ -854,7 +854,7 @@ async function runContainerAgentDaemon(
   ensureDaemonContainer(mounts, group.folder);
 
   const { responsePath, requestPath } = writeAgentRequest(group.folder, input);
-  const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+  const timeoutMs = options?.timeoutMs || group.containerConfig?.timeout || CONTAINER_TIMEOUT;
   const abortSignal = options?.abortSignal;
   const containerName = getDaemonContainerName(group.folder);
 

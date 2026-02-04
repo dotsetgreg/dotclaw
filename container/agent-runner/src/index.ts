@@ -316,6 +316,8 @@ function buildSystemInstructions(params: {
   isScheduledTask: boolean;
   isBackgroundTask: boolean;
   taskId?: string;
+  isBackgroundJob: boolean;
+  jobId?: string;
   planBlock?: string;
   taskExtractionPack?: PromptPack | null;
   responseQualityPack?: PromptPack | null;
@@ -334,8 +336,13 @@ function buildSystemInstructions(params: {
     '- `NpmInstall`: install npm dependencies in the workspace.',
     '- `mcp__dotclaw__send_message`: send Telegram messages.',
     '- `mcp__dotclaw__schedule_task`: schedule tasks.',
+    '- `mcp__dotclaw__run_task`: run a scheduled task immediately.',
     '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
     '- `mcp__dotclaw__update_task`: update a task (state, prompt, schedule, status).',
+    '- `mcp__dotclaw__spawn_job`: start a background job.',
+    '- `mcp__dotclaw__job_status`, `mcp__dotclaw__list_jobs`, `mcp__dotclaw__cancel_job`.',
+    '- `mcp__dotclaw__job_update`: log job progress or notify the user.',
+    'Tip: For long-running work (multi-step coding, large research), prefer `mcp__dotclaw__spawn_job` and report back when done.',
     '- `mcp__dotclaw__register_group`: main group only.',
     '- `mcp__dotclaw__remove_group`, `mcp__dotclaw__list_groups`: main group only.',
     '- `mcp__dotclaw__set_model`: main group only.',
@@ -424,6 +431,12 @@ function buildSystemInstructions(params: {
   const backgroundNote = params.isBackgroundTask
     ? 'You are running in the background for a user request. Focus on completing the task and return a complete response without asking follow-up questions unless strictly necessary.'
     : '';
+  const jobNote = params.isBackgroundJob
+    ? `You are running as a background job${params.jobId ? ` (job id: ${params.jobId})` : ''}. Return a complete result. Use \`mcp__dotclaw__job_update\` for progress if needed. Prefer writing large outputs to the job artifacts directory.`
+    : '';
+  const jobArtifactsNote = params.isBackgroundJob && params.jobId
+    ? `Job artifacts directory: /workspace/group/jobs/${params.jobId}`
+    : '';
 
   const taskExtractionBlock = params.taskExtractionPack
     ? formatTaskExtractionPack({
@@ -477,6 +490,8 @@ function buildSystemInstructions(params: {
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
     scheduledNote,
     backgroundNote,
+    jobNote,
+    jobArtifactsNote,
     toolsDoc,
     browserAutomation,
     groupNotes,
@@ -817,7 +832,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     config.temperature = input.modelTemperature;
   }
   const openrouterOptions = getOpenRouterOptions(agentConfig);
-  const maxToolSteps = agent.tools.maxToolSteps;
+  const maxToolSteps = Number.isFinite(input.maxToolSteps)
+    ? Math.max(1, Math.floor(input.maxToolSteps as number))
+    : agent.tools.maxToolSteps;
   const memoryExtractionEnabled = agent.memory.extraction.enabled;
   const isDaemon = process.env.DOTCLAW_DAEMON === '1';
   const memoryExtractionAsync = agent.memory.extraction.async;
@@ -1064,6 +1081,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     isScheduledTask: !!input.isScheduledTask,
     isBackgroundTask: !!input.isBackgroundTask,
     taskId: input.taskId,
+    isBackgroundJob: !!input.isBackgroundJob,
+    jobId: input.jobId,
     planBlock: planBlockValue,
     taskExtractionPack: taskPackResult?.pack || null,
     responseQualityPack: responseQualityResult?.pack || null,

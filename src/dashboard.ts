@@ -30,6 +30,7 @@ interface HealthStatus {
     status: 'ok' | 'error';
     messageCount?: number;
     taskCount?: number;
+    jobCount?: number;
     memoryItemCount?: number;
     error?: string;
   };
@@ -101,6 +102,7 @@ function checkDatabaseHealth(): HealthStatus['database'] {
 
     let messageCount = 0;
     let taskCount = 0;
+    let jobCount = 0;
     let memoryItemCount = 0;
 
     if (fs.existsSync(messagesDbPath)) {
@@ -111,6 +113,9 @@ function checkDatabaseHealth(): HealthStatus['database'] {
 
         const taskRow = db.prepare('SELECT COUNT(*) as count FROM scheduled_tasks').get() as { count: number };
         taskCount = taskRow?.count || 0;
+
+        const jobRow = db.prepare('SELECT COUNT(*) as count FROM background_jobs').get() as { count: number };
+        jobCount = jobRow?.count || 0;
       } finally {
         db.close();
       }
@@ -130,6 +135,7 @@ function checkDatabaseHealth(): HealthStatus['database'] {
       status: 'ok',
       messageCount,
       taskCount,
+      jobCount,
       memoryItemCount
     };
   } catch (err) {
@@ -462,6 +468,10 @@ function renderHtmlDashboard(health: HealthStatus): string {
         <div class="metric">
           <span class="metric-label">Scheduled Tasks</span>
           <span class="metric-value">${health.database.taskCount?.toLocaleString() ?? '-'}</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Background Jobs</span>
+          <span class="metric-value">${health.database.jobCount?.toLocaleString() ?? '-'}</span>
         </div>
         <div class="metric">
           <span class="metric-label">Queue Depth</span>

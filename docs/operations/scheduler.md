@@ -28,6 +28,7 @@ schedule a daily standup summary at 9:30am
 ```
 
 Ask the assistant to list, pause, resume, or cancel tasks when needed.
+You can also ask it to run a scheduled task immediately without changing its schedule.
 
 ## Targeting other groups
 
