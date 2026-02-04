@@ -107,12 +107,16 @@ export type RuntimeConfig = {
       intervalMs: number;
       groupFolder: string;
     };
-    backgroundTasks: {
+    backgroundJobs: {
       enabled: boolean;
-      triggerRegex: string;
-      ackMessage: string;
+      pollIntervalMs: number;
+      maxConcurrent: number;
+      maxRuntimeMs: number;
+      maxToolSteps: number;
+      inlineMaxChars: number;
+      contextModeDefault: 'group' | 'isolated';
+      toolAllow: string[];
       toolDeny: string[];
-      preemptOnNewMessage: boolean;
     };
     toolBudgets: {
       enabled: boolean;
@@ -338,12 +342,22 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       intervalMs: 900_000,
       groupFolder: 'main'
     },
-    backgroundTasks: {
+    backgroundJobs: {
       enabled: true,
-      triggerRegex: '(research|market research|competitive|landscape|audit|benchmark|deep dive|investigate|analysis|report|roadmap|spec|design|architecture|scan|scrape|crawl|summarize)',
-      ackMessage: "Got it - I'll work on that and follow up when it's ready.",
-      toolDeny: [],
-      preemptOnNewMessage: false
+      pollIntervalMs: 2000,
+      maxConcurrent: 2,
+      maxRuntimeMs: 2_400_000,
+      maxToolSteps: 64,
+      inlineMaxChars: 8000,
+      contextModeDefault: 'group',
+      toolAllow: [],
+      toolDeny: [
+        'mcp__dotclaw__schedule_task',
+        'mcp__dotclaw__update_task',
+        'mcp__dotclaw__pause_task',
+        'mcp__dotclaw__resume_task',
+        'mcp__dotclaw__cancel_task'
+      ]
     },
     toolBudgets: {
       enabled: true,

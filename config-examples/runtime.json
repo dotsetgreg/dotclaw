@@ -15,6 +15,11 @@
       "embeddings": {
         "enabled": true
       }
+    },
+    "backgroundJobs": {
+      "enabled": true,
+      "maxConcurrent": 2,
+      "maxRuntimeMs": 2400000
     }
   },
   "agent": {

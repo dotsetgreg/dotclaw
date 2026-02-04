@@ -1,7 +1,15 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { NewMessage, ScheduledTask, TaskRunLog } from './types.js';
+import {
+  NewMessage,
+  ScheduledTask,
+  TaskRunLog,
+  BackgroundJob,
+  BackgroundJobRunLog,
+  BackgroundJobEvent,
+  BackgroundJobStatus
+} from './types.js';
 import { STORE_DIR } from './config.js';
 
 let db: Database.Database;
@@ -63,6 +71,57 @@ export function initDatabase(): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+    CREATE TABLE IF NOT EXISTS background_jobs (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      context_mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      timeout_ms INTEGER,
+      max_tool_steps INTEGER,
+      tool_policy_json TEXT,
+      model_override TEXT,
+      priority INTEGER DEFAULT 0,
+      tags TEXT,
+      parent_trace_id TEXT,
+      parent_message_id TEXT,
+      result_summary TEXT,
+      output_path TEXT,
+      output_truncated INTEGER DEFAULT 0,
+      last_error TEXT,
+      lease_expires_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_background_jobs_status ON background_jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_background_jobs_group ON background_jobs(group_folder, created_at);
+
+    CREATE TABLE IF NOT EXISTS background_job_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL,
+      run_at TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      result_summary TEXT,
+      error TEXT,
+      FOREIGN KEY (job_id) REFERENCES background_jobs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_background_job_runs ON background_job_runs(job_id, run_at);
+
+    CREATE TABLE IF NOT EXISTS background_job_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      level TEXT NOT NULL,
+      message TEXT NOT NULL,
+      data_json TEXT,
+      FOREIGN KEY (job_id) REFERENCES background_jobs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_background_job_events ON background_job_events(job_id, created_at);
 
     CREATE TABLE IF NOT EXISTS chat_state (
       chat_jid TEXT PRIMARY KEY,
@@ -318,11 +377,202 @@ export function updateTaskAfterRun(
   `).run(nextRun, now, lastResult, lastError, retryCount, nextRun, id);
 }
 
+export function updateTaskRunStatsOnly(
+  id: string,
+  lastResult: string,
+  lastError: string | null
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE scheduled_tasks
+    SET last_run = ?, last_result = ?, last_error = ?
+    WHERE id = ?
+  `).run(now, lastResult, lastError, id);
+}
+
 export function logTaskRun(log: TaskRunLog): void {
   db.prepare(`
     INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(log.task_id, log.run_at, log.duration_ms, log.status, log.result, log.error);
+}
+
+export function createBackgroundJob(job: {
+  id: string;
+  group_folder: string;
+  chat_jid: string;
+  prompt: string;
+  context_mode: 'group' | 'isolated';
+  status?: BackgroundJobStatus;
+  created_at?: string;
+  updated_at?: string;
+  timeout_ms?: number | null;
+  max_tool_steps?: number | null;
+  tool_policy_json?: string | null;
+  model_override?: string | null;
+  priority?: number | null;
+  tags?: string | null;
+  parent_trace_id?: string | null;
+  parent_message_id?: string | null;
+}): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO background_jobs (
+      id, group_folder, chat_jid, prompt, context_mode, status, created_at, updated_at,
+      started_at, finished_at, timeout_ms, max_tool_steps, tool_policy_json, model_override,
+      priority, tags, parent_trace_id, parent_message_id, result_summary, output_path,
+      output_truncated, last_error, lease_expires_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    job.id,
+    job.group_folder,
+    job.chat_jid,
+    job.prompt,
+    job.context_mode,
+    job.status || 'queued',
+    job.created_at || now,
+    job.updated_at || now,
+    null,
+    null,
+    job.timeout_ms ?? null,
+    job.max_tool_steps ?? null,
+    job.tool_policy_json ?? null,
+    job.model_override ?? null,
+    job.priority ?? 0,
+    job.tags ?? null,
+    job.parent_trace_id ?? null,
+    job.parent_message_id ?? null,
+    null,
+    null,
+    0,
+    null,
+    null
+  );
+}
+
+export function getBackgroundJobById(id: string): BackgroundJob | undefined {
+  return db.prepare('SELECT * FROM background_jobs WHERE id = ?').get(id) as BackgroundJob | undefined;
+}
+
+export function listBackgroundJobs(params: { groupFolder?: string; status?: BackgroundJobStatus; limit?: number } = {}): BackgroundJob[] {
+  const clauses: string[] = [];
+  const values: Array<string | number> = [];
+  if (params.groupFolder) {
+    clauses.push('group_folder = ?');
+    values.push(params.groupFolder);
+  }
+  if (params.status) {
+    clauses.push('status = ?');
+    values.push(params.status);
+  }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const limit = params.limit && params.limit > 0 ? `LIMIT ${Math.floor(params.limit)}` : '';
+  return db.prepare(`
+    SELECT * FROM background_jobs
+    ${where}
+    ORDER BY created_at DESC
+    ${limit}
+  `).all(...values) as BackgroundJob[];
+}
+
+export function updateBackgroundJob(id: string, updates: Partial<Pick<BackgroundJob,
+  'status' | 'updated_at' | 'started_at' | 'finished_at' | 'timeout_ms' | 'max_tool_steps' |
+  'tool_policy_json' | 'model_override' | 'priority' | 'tags' | 'parent_trace_id' |
+  'parent_message_id' | 'result_summary' | 'output_path' | 'output_truncated' |
+  'last_error' | 'lease_expires_at'
+>>): void {
+  const fields: string[] = [];
+  const values: Array<string | number | null> = [];
+
+  const setIfDefined = (field: keyof typeof updates, column: string) => {
+    if (updates[field] !== undefined) {
+      fields.push(`${column} = ?`);
+      values.push(updates[field] as string | number | null);
+    }
+  };
+
+  setIfDefined('status', 'status');
+  setIfDefined('updated_at', 'updated_at');
+  setIfDefined('started_at', 'started_at');
+  setIfDefined('finished_at', 'finished_at');
+  setIfDefined('timeout_ms', 'timeout_ms');
+  setIfDefined('max_tool_steps', 'max_tool_steps');
+  setIfDefined('tool_policy_json', 'tool_policy_json');
+  setIfDefined('model_override', 'model_override');
+  setIfDefined('priority', 'priority');
+  setIfDefined('tags', 'tags');
+  setIfDefined('parent_trace_id', 'parent_trace_id');
+  setIfDefined('parent_message_id', 'parent_message_id');
+  setIfDefined('result_summary', 'result_summary');
+  setIfDefined('output_path', 'output_path');
+  setIfDefined('output_truncated', 'output_truncated');
+  setIfDefined('last_error', 'last_error');
+  setIfDefined('lease_expires_at', 'lease_expires_at');
+
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE background_jobs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+}
+
+export function claimNextBackgroundJob(params: { now: string; defaultLeaseMs: number }): BackgroundJob | null {
+  const select = db.prepare(`
+    SELECT * FROM background_jobs
+    WHERE status = 'queued'
+    ORDER BY priority DESC, created_at ASC
+    LIMIT 1
+  `);
+  const update = db.prepare(`
+    UPDATE background_jobs
+    SET status = 'running', started_at = ?, updated_at = ?, lease_expires_at = ?
+    WHERE id = ? AND status = 'queued'
+  `);
+
+  const txn = db.transaction(() => {
+    const job = select.get() as BackgroundJob | undefined;
+    if (!job) return null;
+    const leaseMs = typeof job.timeout_ms === 'number' && job.timeout_ms > 0
+      ? job.timeout_ms
+      : params.defaultLeaseMs;
+    const leaseExpiresAt = new Date(Date.now() + leaseMs).toISOString();
+    const info = update.run(params.now, params.now, leaseExpiresAt, job.id);
+    if (info.changes === 0) return null;
+    return {
+      ...job,
+      status: 'running',
+      started_at: params.now,
+      updated_at: params.now,
+      lease_expires_at: leaseExpiresAt
+    } as BackgroundJob;
+  });
+
+  return txn();
+}
+
+export function failExpiredBackgroundJobs(nowIso: string): number {
+  const info = db.prepare(`
+    UPDATE background_jobs
+    SET status = 'timed_out',
+        finished_at = ?,
+        updated_at = ?,
+        last_error = COALESCE(last_error, 'Job lease expired')
+    WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+  `).run(nowIso, nowIso, nowIso);
+  return info.changes;
+}
+
+export function logBackgroundJobRun(log: BackgroundJobRunLog): void {
+  db.prepare(`
+    INSERT INTO background_job_runs (job_id, run_at, duration_ms, status, result_summary, error)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(log.job_id, log.run_at, log.duration_ms, log.status, log.result_summary, log.error);
+}
+
+export function logBackgroundJobEvent(event: BackgroundJobEvent): void {
+  db.prepare(`
+    INSERT INTO background_job_events (job_id, created_at, level, message, data_json)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(event.job_id, event.created_at, event.level, event.message, event.data_json ?? null);
 }
 
 export function logToolCalls(params: {

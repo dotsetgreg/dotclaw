@@ -35,3 +35,7 @@ Tools are governed by `~/.dotclaw/config/tool-policy.json`. You can allow or den
 ## Scheduler
 
 The task scheduler runs cron-based or one-off tasks and executes them in the target group's context. Scheduling uses the timezone defined in `~/.dotclaw/config/runtime.json` or the system timezone by default.
+
+## Background jobs
+
+Background jobs run long-lived work asynchronously and report back when finished. Jobs are durable and tracked in the database. Large outputs are written to `~/.dotclaw/groups/<group>/jobs/<job_id>/` and summarized in chat.

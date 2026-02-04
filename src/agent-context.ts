@@ -54,6 +54,7 @@ export async function buildAgentContext(params: {
   recallQuery: string;
   recallMaxResults: number;
   recallMaxTokens: number;
+  toolAllow?: string[];
   toolDeny?: string[];
 }): Promise<AgentContext> {
   const runtime = loadRuntimeConfig();
@@ -109,9 +110,17 @@ export async function buildAgentContext(params: {
     userId: params.userId ?? null,
     toolPolicy: baseToolPolicy
   });
-  const toolPolicy = params.toolDeny && params.toolDeny.length > 0
+  let toolPolicy = params.toolDeny && params.toolDeny.length > 0
     ? mergeToolPolicyDeny(budgetedToolPolicy, params.toolDeny)
     : budgetedToolPolicy;
+
+  if (params.toolAllow && params.toolAllow.length > 0) {
+    const allowSet = new Set(params.toolAllow.map(item => item.trim()).filter(Boolean));
+    toolPolicy = {
+      ...toolPolicy,
+      allow: (toolPolicy.allow || []).filter(name => allowSet.has(name))
+    };
+  }
 
   const toolReliability = getToolReliability({ groupFolder: params.groupFolder, limit: 200 })
     .map(row => ({

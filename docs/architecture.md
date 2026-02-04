@@ -12,6 +12,8 @@ Telegram (Telegraf)
   -> SQLite (messages.db)
   -> Docker container (agent runtime)
   -> Response back to Telegram
+
+Background jobs follow the same path but run asynchronously and report completion when finished.
 ```
 
 ## Key directories
@@ -55,6 +57,7 @@ All runtime data is stored in `~/.dotclaw` (configurable via `DOTCLAW_HOME` envi
     main/CLAUDE.md        Main group memory
     global/CLAUDE.md      Global memory
     <group>/CLAUDE.md     Group memory
+    <group>/jobs/         Background job artifacts
   logs/
   prompts/
   traces/

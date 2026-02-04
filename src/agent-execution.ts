@@ -75,15 +75,20 @@ export async function executeAgentRun(params: {
   recallQuery: string;
   recallMaxResults: number;
   recallMaxTokens: number;
+  toolAllow?: string[];
   toolDeny?: string[];
+  modelOverride?: string;
   sessionId?: string;
   persistSession?: boolean;
   onSessionUpdate?: (sessionId: string) => void;
   useGroupLock?: boolean;
+  useSemaphore?: boolean;
   abortSignal?: AbortSignal;
   isScheduledTask?: boolean;
   isBackgroundTask?: boolean;
   taskId?: string;
+  jobId?: string;
+  isBackgroundJob?: boolean;
   streaming?: {
     enabled: boolean;
     draftId: number;
@@ -91,11 +96,14 @@ export async function executeAgentRun(params: {
     minChars?: number;
   };
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
+  maxToolSteps?: number;
+  timeoutMs?: number;
 }): Promise<{ output: ContainerOutput; context: AgentContext }> {
   const group = params.group;
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const persistSession = params.persistSession !== false;
   const useGroupLock = params.useGroupLock !== false;
+  const useSemaphore = params.useSemaphore !== false;
 
   writeTasksSnapshot(group.folder, isMain, buildTaskSnapshot());
   if (isMain && params.availableGroups) {
@@ -108,6 +116,7 @@ export async function executeAgentRun(params: {
     recallQuery: params.recallQuery,
     recallMaxResults: params.recallMaxResults,
     recallMaxTokens: params.recallMaxTokens,
+    toolAllow: params.toolAllow,
     toolDeny: params.toolDeny
   });
 
@@ -120,6 +129,8 @@ export async function executeAgentRun(params: {
     isScheduledTask: params.isScheduledTask,
     isBackgroundTask: params.isBackgroundTask,
     taskId: params.taskId,
+    jobId: params.jobId,
+    isBackgroundJob: params.isBackgroundJob,
     userId: params.userId ?? undefined,
     userName: params.userName,
     memoryRecall: context.memoryRecall,
@@ -129,20 +140,20 @@ export async function executeAgentRun(params: {
     toolReliability: context.toolReliability,
     behaviorConfig: context.behaviorConfig as Record<string, unknown>,
     toolPolicy: context.toolPolicy as Record<string, unknown>,
-    modelOverride: context.resolvedModel.model,
+    modelOverride: params.modelOverride || context.resolvedModel.model,
     modelContextTokens: context.resolvedModel.override?.context_window,
     modelMaxOutputTokens: context.resolvedModel.override?.max_output_tokens,
     modelTemperature: context.resolvedModel.override?.temperature,
-    streaming: params.streaming
-  }, { abortSignal: params.abortSignal });
+    streaming: params.streaming,
+    maxToolSteps: params.maxToolSteps
+  }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });
 
   let output: ContainerOutput;
   try {
-    output = await runWithAgentSemaphore(() =>
-      useGroupLock
-        ? withGroupLock(group.folder, () => runContainer())
-        : runContainer()
-    );
+    const runner = () => (useGroupLock ? withGroupLock(group.folder, () => runContainer()) : runContainer());
+    output = useSemaphore
+      ? await runWithAgentSemaphore(runner)
+      : await runner();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new AgentExecutionError(message, context);

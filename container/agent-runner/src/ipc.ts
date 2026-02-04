@@ -258,6 +258,41 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       return requestResponse('list_groups', {}, config);
     },
 
+    async runTask(taskId: string) {
+      return requestResponse('run_task', { task_id: taskId }, config);
+    },
+
+    async spawnJob(args: {
+      prompt: string;
+      context_mode?: 'group' | 'isolated';
+      timeout_ms?: number;
+      max_tool_steps?: number;
+      tool_allow?: string[];
+      tool_deny?: string[];
+      model_override?: string;
+      priority?: number;
+      tags?: string[];
+      target_group?: string;
+    }) {
+      return requestResponse('spawn_job', args as Record<string, unknown>, config);
+    },
+
+    async jobStatus(jobId: string) {
+      return requestResponse('job_status', { job_id: jobId }, config);
+    },
+
+    async listJobs(args: { status?: string; limit?: number; target_group?: string }) {
+      return requestResponse('list_jobs', args as Record<string, unknown>, config);
+    },
+
+    async cancelJob(jobId: string) {
+      return requestResponse('cancel_job', { job_id: jobId }, config);
+    },
+
+    async jobUpdate(args: { job_id: string; message: string; level?: string; notify?: boolean; data?: Record<string, unknown> }) {
+      return requestResponse('job_update', args as Record<string, unknown>, config);
+    },
+
     async setModel(args: { model: string; scope?: 'global' | 'group' | 'user'; target_id?: string }) {
       if (!isMain) {
         return { ok: false, error: 'Only the main group can change the model.' };

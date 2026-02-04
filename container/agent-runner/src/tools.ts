@@ -1456,6 +1456,20 @@ export function createTools(ctx: IpcContext, config: AgentRuntimeConfig['agent']
       ipc.scheduleTask(args))
   });
 
+  const runTaskTool = tool({
+    name: 'mcp__dotclaw__run_task',
+    description: 'Run an existing scheduled task immediately without modifying its schedule.',
+    inputSchema: z.object({
+      task_id: z.string()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__run_task', async ({ task_id }: { task_id: string }) => ipc.runTask(task_id))
+  });
+
   const listTasksTool = tool({
     name: 'mcp__dotclaw__list_tasks',
     description: 'List all scheduled tasks.',
@@ -1521,6 +1535,101 @@ export function createTools(ctx: IpcContext, config: AgentRuntimeConfig['agent']
     }),
     execute: wrapExecute('mcp__dotclaw__update_task', async (args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) =>
       ipc.updateTask(args))
+  });
+
+  const spawnJobTool = tool({
+    name: 'mcp__dotclaw__spawn_job',
+    description: 'Start a background job that runs asynchronously and reports results later.',
+    inputSchema: z.object({
+      prompt: z.string(),
+      context_mode: z.enum(['group', 'isolated']).optional(),
+      timeout_ms: z.number().optional(),
+      max_tool_steps: z.number().optional(),
+      tool_allow: z.array(z.string()).optional(),
+      tool_deny: z.array(z.string()).optional(),
+      model_override: z.string().optional(),
+      priority: z.number().optional(),
+      tags: z.array(z.string()).optional(),
+      target_group: z.string().optional()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__spawn_job', async (args: {
+      prompt: string;
+      context_mode?: 'group' | 'isolated';
+      timeout_ms?: number;
+      max_tool_steps?: number;
+      tool_allow?: string[];
+      tool_deny?: string[];
+      model_override?: string;
+      priority?: number;
+      tags?: string[];
+      target_group?: string;
+    }) => ipc.spawnJob(args))
+  });
+
+  const jobStatusTool = tool({
+    name: 'mcp__dotclaw__job_status',
+    description: 'Get the status of a background job.',
+    inputSchema: z.object({
+      job_id: z.string()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__job_status', async ({ job_id }: { job_id: string }) => ipc.jobStatus(job_id))
+  });
+
+  const listJobsTool = tool({
+    name: 'mcp__dotclaw__list_jobs',
+    description: 'List background jobs for the group.',
+    inputSchema: z.object({
+      status: z.string().optional(),
+      limit: z.number().optional(),
+      target_group: z.string().optional()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__list_jobs', async (args: { status?: string; limit?: number; target_group?: string }) => ipc.listJobs(args))
+  });
+
+  const cancelJobTool = tool({
+    name: 'mcp__dotclaw__cancel_job',
+    description: 'Cancel a background job.',
+    inputSchema: z.object({
+      job_id: z.string()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__cancel_job', async ({ job_id }: { job_id: string }) => ipc.cancelJob(job_id))
+  });
+
+  const jobUpdateTool = tool({
+    name: 'mcp__dotclaw__job_update',
+    description: 'Log progress or send a notification for a background job.',
+    inputSchema: z.object({
+      job_id: z.string(),
+      message: z.string(),
+      level: z.enum(['info', 'progress', 'warn', 'error']).optional(),
+      notify: z.boolean().optional(),
+      data: z.record(z.string(), z.any()).optional()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__job_update', async (args: { job_id: string; message: string; level?: string; notify?: boolean; data?: Record<string, unknown> }) =>
+      ipc.jobUpdate(args))
   });
 
   const registerGroupTool = tool({
@@ -1692,11 +1801,17 @@ export function createTools(ctx: IpcContext, config: AgentRuntimeConfig['agent']
     npmInstallTool,
     sendMessageTool,
     scheduleTaskTool,
+    runTaskTool,
     listTasksTool,
     pauseTaskTool,
     resumeTaskTool,
     cancelTaskTool,
     updateTaskTool,
+    spawnJobTool,
+    jobStatusTool,
+    listJobsTool,
+    cancelJobTool,
+    jobUpdateTool,
     memoryUpsertTool,
     memoryForgetTool,
     memoryListTool,
