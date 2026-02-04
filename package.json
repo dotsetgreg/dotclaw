@@ -1,9 +1,45 @@
 {
-  "name": "dotclaw",
-  "version": "1.0.0",
+  "name": "@dotsetlabs/dotclaw",
+  "version": "1.1.0",
   "description": "Personal OpenRouter-based assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "dotclaw": "./dist/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dotsetlabs/dotclaw.git"
+  },
+  "keywords": [
+    "ai",
+    "assistant",
+    "openrouter",
+    "telegram",
+    "agent",
+    "llm"
+  ],
+  "files": [
+    "dist",
+    "container/Dockerfile",
+    "container/build.sh",
+    "container/.dockerignore",
+    "container/skills",
+    "container/agent-runner/package.json",
+    "container/agent-runner/package-lock.json",
+    "container/agent-runner/tsconfig.json",
+    "container/agent-runner/src",
+    "scripts/init.js",
+    "scripts/bootstrap.js",
+    "scripts/configure.js",
+    "scripts/doctor.js",
+    "scripts/autotune.js",
+    "scripts/install.sh",
+    "config-examples",
+    "launchd",
+    "systemd",
+    ".env.example"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -16,7 +52,11 @@
     "autotune": "node scripts/autotune.js",
     "lint": "eslint . --max-warnings=0",
     "test": "npm run build && node --test test/**/*.test.js && npm run test:agent-runner",
-    "test:agent-runner": "node scripts/test-agent-runner.js"
+    "test:agent-runner": "node scripts/test-agent-runner.js",
+    "prepublishOnly": "npm run build && npm run lint && npm test",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
   },
   "dependencies": {
     "@dotsetlabs/autotune": "^1.1.0",
@@ -37,9 +77,13 @@
     "globals": "^15.14.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "typescript-eslint": "^8.23.0"
+    "typescript-eslint": "^8.23.0",
+    "vitepress": "^1.2.0"
   },
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

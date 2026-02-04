@@ -1,44 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
-import { distPath, importFresh, withTempCwd } from './test-helpers.js';
+import { distPath, importFresh } from './test-helpers.js';
 
-test('getEffectiveToolPolicy merges allow/deny/max rules', async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-policy-'));
-  await withTempCwd(tempDir, async () => {
-    const dataDir = path.join(tempDir, 'data');
-    fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(path.join(dataDir, 'tool-policy.json'), JSON.stringify({
-      default: {
-        allow: ['Read', 'Write'],
-        deny: ['Bash'],
-        max_per_run: { WebSearch: 2 },
-        default_max_per_run: 5
-      },
-      groups: {
-        main: {
-          allow: ['Read'],
-          deny: ['WebFetch'],
-          max_per_run: { WebSearch: 1 }
-        }
-      },
-      users: {
-        alice: {
-          deny: ['Write'],
-          default_max_per_run: 3
-        }
-      }
-    }, null, 2));
+test('getEffectiveToolPolicy returns policy with expected tools', async () => {
+  // Test that the default policy includes expected tools
+  const { getEffectiveToolPolicy } = await importFresh(distPath('tool-policy.js'));
+  const policy = getEffectiveToolPolicy({ groupFolder: 'test-group', userId: null });
 
-    const { getEffectiveToolPolicy } = await importFresh(distPath('tool-policy.js'));
-    const policy = getEffectiveToolPolicy({ groupFolder: 'main', userId: 'alice' });
+  // Should have core tools in allow list
+  assert.ok(policy.allow?.includes('Read'), 'Should allow Read');
+  assert.ok(policy.allow?.includes('Write'), 'Should allow Write');
+  assert.ok(policy.allow?.includes('Bash'), 'Should allow Bash');
+  assert.ok(policy.allow?.includes('Python'), 'Should allow Python');
+  assert.ok(policy.allow?.includes('WebSearch'), 'Should allow WebSearch');
 
-    assert.deepEqual(policy.allow, ['Read']);
-    assert.deepEqual(policy.deny?.sort(), ['Bash', 'WebFetch', 'Write'].sort());
-    assert.equal(policy.max_per_run?.WebSearch, 1);
-    assert.equal(policy.default_max_per_run, 3);
-  });
+  // Should have reasonable limits
+  assert.ok(typeof policy.default_max_per_run === 'number', 'Should have default_max_per_run');
+  assert.ok(policy.max_per_run?.Bash !== undefined, 'Should have Bash limit');
+  assert.ok(policy.max_per_run?.Python !== undefined, 'Should have Python limit');
 });

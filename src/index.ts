@@ -1,6 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import { Telegraf } from 'telegraf';
-import pino from 'pino';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -9,21 +8,20 @@ import {
   DATA_DIR,
   MAIN_GROUP_FOLDER,
   GROUPS_DIR,
-  IPC_POLL_INTERVAL,
-  CONTAINER_TIMEOUT,
-  TIMEZONE,
+  IPC_POLL_INTERVAL,  TIMEZONE,
   CONTAINER_MODE,
-  WARM_START_ENABLED
+  WARM_START_ENABLED,
+  ENV_PATH
 } from './config.js';
-import { RegisteredGroup, Session } from './types.js';
+
+// Load .env from the canonical location (~/.dotclaw/.env)
+dotenv.config({ path: ENV_PATH });
+import { RegisteredGroup, Session, NewMessage } from './types.js';
 import {
   initDatabase,
-  storeMessage,
-  storeChatMetadata,
-  getMessagesSinceCursor,
+  storeMessage,  getMessagesSinceCursor,
   getChatState,
   updateChatState,
-  getAllTasks,
   createTask,
   updateTask,
   deleteTask,
@@ -32,19 +30,18 @@ import {
   setGroupSession,
   deleteGroupSession,
   pauseTasksForGroup,
-  logToolCalls,
-  getToolReliability
+  linkMessageToTrace,
+  getTraceIdForMessage,
+  recordUserFeedback
 } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
-import type { ContainerOutput } from './container-runner.js';
+import type { ContainerOutput } from './container-protocol.js';
+import type { AgentContext } from './agent-context.js';
 import { loadJson, saveJson, isSafeGroupFolder } from './utils.js';
 import { writeTrace } from './trace-writer.js';
 import { formatTelegramMessage, TELEGRAM_PARSE_MODE } from './telegram-format.js';
-import { withGroupLock } from './locks.js';
 import {
   initMemoryStore,
-  buildUserProfile,
   getMemoryStats,
   upsertMemoryItems,
   searchMemories,
@@ -55,35 +52,42 @@ import {
   MemoryType,
   MemoryItemInput
 } from './memory-store.js';
-import { buildHybridMemoryRecall } from './memory-recall.js';
 import { startEmbeddingWorker } from './memory-embeddings.js';
-import { loadPersonalizedBehaviorConfig } from './personalization.js';
-import { createProgressNotifier, DEFAULT_PROGRESS_MESSAGES, parseProgressMessages } from './progress.js';
+import { createProgressNotifier, DEFAULT_PROGRESS_MESSAGES } from './progress.js';
 import { parseAdminCommand } from './admin-commands.js';
-import { getEffectiveToolPolicy } from './tool-policy.js';
-import { applyToolBudgets } from './tool-budgets.js';
-import { resolveModel, loadModelRegistry, saveModelRegistry, getTokenEstimateConfig, getModelPricing } from './model-registry.js';
-import { startMetricsServer, recordMessage, recordError, recordToolCall, recordLatency, recordTokenUsage, recordCost, recordMemoryRecall, recordMemoryUpsert, recordMemoryExtract } from './metrics.js';
-import { computeCostUSD } from './cost.js';
-import { runWithAgentSemaphore } from './agent-semaphore.js';
+import { loadModelRegistry, saveModelRegistry } from './model-registry.js';
+import { startMetricsServer, recordMessage, recordError } from './metrics.js';
 import { startMaintenanceLoop } from './maintenance.js';
-import { warmGroupContainer } from './container-runner.js';
+import { warmGroupContainer, startDaemonHealthCheckLoop } from './container-runner.js';
+import { loadRuntimeConfig } from './runtime-config.js';
+import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
+import { logger } from './logger.js';
+import { startDashboard, setTelegramConnected, setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
+import { humanizeError } from './error-messages.js';
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport: { target: 'pino-pretty', options: { colorize: true } }
-});
+const runtime = loadRuntimeConfig();
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+function buildTriggerRegex(pattern: string | undefined): RegExp | null {
+  if (!pattern) return null;
+  try {
+    return new RegExp(pattern, 'i');
+  } catch {
+    return null;
+  }
 }
 
-function isEnabledEnv(name: string, defaultValue = true): boolean {
-  const value = (process.env[name] || '').toLowerCase().trim();
-  if (!value) return defaultValue;
-  return !['0', 'false', 'no', 'off'].includes(value);
+function isPreemptedError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.toLowerCase().includes('preempt');
+}
+
+function buildAvailableGroupsSnapshot(): Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }> {
+  return Object.entries(registeredGroups).map(([jid, info]) => ({
+    jid,
+    name: info.name,
+    lastActivity: getChatState(jid)?.last_agent_timestamp || info.added_at,
+    isRegistered: true
+  }));
 }
 
 
@@ -111,6 +115,13 @@ function isMemoryKind(value: unknown): value is 'semantic' | 'episodic' | 'proce
     || value === 'episodic'
     || value === 'procedural'
     || value === 'preference';
+}
+
+function clampInputMessage(content: string, maxChars: number): string {
+  if (!content) return '';
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return content;
+  if (content.length <= maxChars) return content;
+  return `${content.slice(0, maxChars)}\n\n[Message truncated for length]`;
 }
 
 function coerceMemoryItems(input: unknown): MemoryItemInput[] {
@@ -146,22 +157,82 @@ function coerceMemoryItems(input: unknown): MemoryItemInput[] {
   return items;
 }
 
-const TELEGRAM_HANDLER_TIMEOUT_MS = parsePositiveInt(
-  process.env.DOTCLAW_TELEGRAM_HANDLER_TIMEOUT_MS,
-  Math.max(CONTAINER_TIMEOUT + 30_000, 120_000)
-);
-const TELEGRAM_SEND_RETRIES = parsePositiveInt(process.env.DOTCLAW_TELEGRAM_SEND_RETRIES, 3);
-const TELEGRAM_SEND_RETRY_DELAY_MS = parsePositiveInt(process.env.DOTCLAW_TELEGRAM_SEND_RETRY_DELAY_MS, 1000);
-const MEMORY_RECALL_MAX_RESULTS = parsePositiveInt(process.env.DOTCLAW_MEMORY_RECALL_MAX_RESULTS, 8);
-const MEMORY_RECALL_MAX_TOKENS = parsePositiveInt(process.env.DOTCLAW_MEMORY_RECALL_MAX_TOKENS, 1200);
-const PROGRESS_ENABLED = isEnabledEnv('DOTCLAW_PROGRESS_ENABLED', true);
-const PROGRESS_INITIAL_MS = parsePositiveInt(process.env.DOTCLAW_PROGRESS_INITIAL_MS, 30000);
-const PROGRESS_INTERVAL_MS = parsePositiveInt(process.env.DOTCLAW_PROGRESS_INTERVAL_MS, 60000);
-const PROGRESS_MAX_UPDATES = parsePositiveInt(process.env.DOTCLAW_PROGRESS_MAX_UPDATES, 3);
-const PROGRESS_MESSAGES = parseProgressMessages(process.env.DOTCLAW_PROGRESS_MESSAGES, DEFAULT_PROGRESS_MESSAGES);
-const HEARTBEAT_ENABLED = isEnabledEnv('DOTCLAW_HEARTBEAT_ENABLED', true);
-const HEARTBEAT_INTERVAL_MS = parsePositiveInt(process.env.DOTCLAW_HEARTBEAT_INTERVAL_MS, 900000);
-const HEARTBEAT_GROUP_FOLDER = (process.env.DOTCLAW_HEARTBEAT_GROUP || MAIN_GROUP_FOLDER).trim() || MAIN_GROUP_FOLDER;
+// Rate limiting configuration
+const RATE_LIMIT_MAX_MESSAGES = 20; // Max messages per user per window
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute window
+
+type RateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+const rateLimiter = new Map<string, RateLimitEntry>();
+
+function checkRateLimit(userId: string): { allowed: boolean; retryAfterMs?: number } {
+  const now = Date.now();
+  const entry = rateLimiter.get(userId);
+
+  if (!entry || now > entry.resetAt) {
+    // New window
+    rateLimiter.set(userId, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { allowed: true };
+  }
+
+  if (entry.count >= RATE_LIMIT_MAX_MESSAGES) {
+    // Rate limited
+    return { allowed: false, retryAfterMs: entry.resetAt - now };
+  }
+
+  // Increment counter
+  entry.count += 1;
+  return { allowed: true };
+}
+
+function cleanupRateLimiter(): void {
+  const now = Date.now();
+  for (const [key, entry] of rateLimiter.entries()) {
+    if (now > entry.resetAt) {
+      rateLimiter.delete(key);
+    }
+  }
+}
+
+// Clean up expired rate limit entries periodically
+setInterval(cleanupRateLimiter, 60_000);
+
+const TELEGRAM_HANDLER_TIMEOUT_MS = runtime.host.telegram.handlerTimeoutMs;
+const TELEGRAM_SEND_RETRIES = runtime.host.telegram.sendRetries;
+const TELEGRAM_SEND_RETRY_DELAY_MS = runtime.host.telegram.sendRetryDelayMs;
+const TELEGRAM_STREAM_MODE = runtime.host.telegram.streamMode.toLowerCase();
+const TELEGRAM_STREAM_MIN_INTERVAL_MS = runtime.host.telegram.streamMinIntervalMs;
+const TELEGRAM_STREAM_MIN_CHARS = runtime.host.telegram.streamMinChars;
+const MEMORY_RECALL_MAX_RESULTS = runtime.host.memory.recall.maxResults;
+const MEMORY_RECALL_MAX_TOKENS = runtime.host.memory.recall.maxTokens;
+const INPUT_MESSAGE_MAX_CHARS = runtime.host.telegram.inputMessageMaxChars;
+const PROGRESS_ENABLED = runtime.host.progress.enabled;
+const PROGRESS_INITIAL_MS = runtime.host.progress.initialMs;
+const PROGRESS_INTERVAL_MS = runtime.host.progress.intervalMs;
+const PROGRESS_MAX_UPDATES = runtime.host.progress.maxUpdates;
+const PROGRESS_MESSAGES = runtime.host.progress.messages.length > 0
+  ? runtime.host.progress.messages
+  : DEFAULT_PROGRESS_MESSAGES;
+const HEARTBEAT_ENABLED = runtime.host.heartbeat.enabled;
+const HEARTBEAT_INTERVAL_MS = runtime.host.heartbeat.intervalMs;
+const HEARTBEAT_GROUP_FOLDER = (runtime.host.heartbeat.groupFolder || MAIN_GROUP_FOLDER).trim() || MAIN_GROUP_FOLDER;
+const BACKGROUND_TASKS_ENABLED = runtime.host.backgroundTasks.enabled;
+const BACKGROUND_TRIGGER_REGEX = runtime.host.backgroundTasks.triggerRegex;
+const BACKGROUND_TRIGGER = buildTriggerRegex(BACKGROUND_TRIGGER_REGEX);
+const BACKGROUND_ACK_MESSAGE = runtime.host.backgroundTasks.ackMessage;
+const BACKGROUND_TOOL_DENY = runtime.host.backgroundTasks.toolDeny;
+const PREEMPT_ON_NEW_MESSAGE = runtime.host.backgroundTasks.preemptOnNewMessage;
+
+function shouldRunInBackground(content: string): boolean {
+  if (!BACKGROUND_TASKS_ENABLED) return false;
+  const trimmed = content.trim();
+  if (!trimmed) return false;
+  if (BACKGROUND_TRIGGER && BACKGROUND_TRIGGER.test(trimmed)) return true;
+  return false;
+}
 
 // Initialize Telegram bot with extended timeout for long-running agent tasks
 const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!, {
@@ -183,6 +254,37 @@ type QueueState = {
 };
 
 const messageQueues = new Map<string, QueueState>();
+const inFlightRuns = new Map<string, { controller: AbortController; runId: string }>();
+
+type TelegramStreamMode = 'off' | 'draft' | 'edit' | 'auto';
+
+type DraftSession = {
+  mode: 'draft' | 'edit';
+  messageThreadId?: number;
+  messageId?: number;
+  started: boolean;
+  lastSentAt: number;
+  lastChunk?: string;
+};
+
+const draftSessions = new Map<string, DraftSession>();
+
+function parseTelegramStreamMode(value: string): TelegramStreamMode {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'draft' || normalized === 'edit' || normalized === 'auto' || normalized === 'off') {
+    return normalized;
+  }
+  return 'off';
+}
+
+function getDraftKey(chatId: string, draftId: number): string {
+  return `${chatId}:${draftId}`;
+}
+
+function createDraftId(): number {
+  const max = 2_147_483_647;
+  return Math.floor(Math.random() * (max - 1)) + 1;
+}
 
 async function setTyping(chatId: string): Promise<void> {
   try {
@@ -190,6 +292,36 @@ async function setTyping(chatId: string): Promise<void> {
   } catch (err) {
     logger.debug({ chatId, err }, 'Failed to set typing indicator');
   }
+}
+
+function canUseTelegramDraft(msg: TelegramMessage): boolean {
+  return msg.chatType === 'private' && Number.isFinite(msg.messageThreadId);
+}
+
+function registerDraftSession(msg: TelegramMessage): { mode: 'draft' | 'edit'; draftId: number } | null {
+  const mode = parseTelegramStreamMode(TELEGRAM_STREAM_MODE);
+  if (mode === 'off') return null;
+  if (msg.chatType !== 'private') return null;
+
+  const supportsDraft = canUseTelegramDraft(msg);
+  const resolvedMode: 'draft' | 'edit' | null = mode === 'auto'
+    ? (supportsDraft ? 'draft' : 'edit')
+    : (mode === 'draft' ? (supportsDraft ? 'draft' : 'edit') : (mode === 'edit' ? 'edit' : null));
+  if (!resolvedMode) return null;
+
+  const draftId = createDraftId();
+  draftSessions.set(getDraftKey(msg.chatId, draftId), {
+    mode: resolvedMode,
+    messageThreadId: msg.messageThreadId,
+    started: false,
+    lastSentAt: 0,
+    lastChunk: undefined
+  });
+  return { mode: resolvedMode, draftId };
+}
+
+function clearDraftSession(chatId: string, draftId: number): void {
+  draftSessions.delete(getDraftKey(chatId, draftId));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -287,26 +419,11 @@ function loadState(): void {
     logger.error({ invalidCount, duplicateCount }, 'Registered groups contained invalid or duplicate folders');
   }
   logger.info({ groupCount: Object.keys(registeredGroups).length }, 'State loaded');
-
-  // Load sessions from DB; migrate legacy sessions.json if DB is empty
-  const dbSessions = getAllGroupSessions();
-  if (dbSessions.length === 0) {
-    const legacySessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
-    for (const [folder, sessionId] of Object.entries(legacySessions)) {
-      if (typeof sessionId === 'string' && sessionId.trim()) {
-        setGroupSession(folder, sessionId);
-      }
-    }
-  }
   const finalSessions = getAllGroupSessions();
   sessions = finalSessions.reduce<Session>((acc, row) => {
     acc[row.group_folder] = row.session_id;
     return acc;
   }, {});
-}
-
-function saveState(): void {
-  saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
 }
 
 function registerGroup(chatId: string, group: RegisteredGroup): void {
@@ -323,7 +440,7 @@ function registerGroup(chatId: string, group: RegisteredGroup): void {
   saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
 
   // Create group folder
-  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
+  const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   logger.info({ chatId, name: group.name, folder: group.folder }, 'Group registered');
@@ -385,12 +502,35 @@ function unregisterGroup(identifier: string): { ok: boolean; error?: string; gro
   return { ok: true, group: { ...group, chat_id: chatId } };
 }
 
-async function sendMessage(chatId: string, text: string): Promise<void> {
-  const chunks = formatTelegramMessage(text, TELEGRAM_MAX_MESSAGE_LENGTH);
+function splitPlainText(text: string, maxLength: number): string[] {
+  if (text.length <= maxLength) return [text];
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += maxLength) {
+    chunks.push(text.slice(i, i + maxLength));
+  }
+  return chunks;
+}
+
+async function sendMessage(
+  chatId: string,
+  text: string,
+  options?: { messageThreadId?: number; parseMode?: string | null }
+): Promise<{ success: boolean; messageId?: string }> {
+  const parseMode = options?.parseMode === undefined ? TELEGRAM_PARSE_MODE : options.parseMode;
+  const chunks = parseMode
+    ? formatTelegramMessage(text, TELEGRAM_MAX_MESSAGE_LENGTH)
+    : splitPlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH);
+  let firstMessageId: string | undefined;
   const sendChunk = async (chunk: string): Promise<boolean> => {
     for (let attempt = 1; attempt <= TELEGRAM_SEND_RETRIES; attempt += 1) {
       try {
-        await telegrafBot.telegram.sendMessage(chatId, chunk, { parse_mode: TELEGRAM_PARSE_MODE });
+        const payload: Record<string, unknown> = {};
+        if (parseMode) payload.parse_mode = parseMode;
+        if (options?.messageThreadId) payload.message_thread_id = options.messageThreadId;
+        const sent = await telegrafBot.telegram.sendMessage(chatId, chunk, payload);
+        if (!firstMessageId) {
+          firstMessageId = String(sent.message_id);
+        }
         return true;
       } catch (err) {
         const retryAfterMs = getTelegramRetryAfterMs(err);
@@ -411,15 +551,130 @@ async function sendMessage(chatId: string, text: string): Promise<void> {
     // Telegram bots send messages as themselves, no prefix needed
     for (let i = 0; i < chunks.length; i += 1) {
       const ok = await sendChunk(chunks[i]);
-      if (!ok) return;
+      if (!ok) return { success: false };
       if (i < chunks.length - 1) {
         await sleep(TELEGRAM_SEND_DELAY_MS);
       }
     }
     logger.info({ chatId, length: text.length }, 'Message sent');
+    return { success: true, messageId: firstMessageId };
   } catch (err) {
     logger.error({ chatId, err }, 'Failed to send message');
+    return { success: false };
   }
+}
+
+async function sendDraftUpdate(chatId: string, draftId: number, text: string): Promise<void> {
+  const key = getDraftKey(chatId, draftId);
+  const session = draftSessions.get(key);
+  if (!session) return;
+  if (!text || !text.trim()) return;
+
+  const now = Date.now();
+  if (now - session.lastSentAt < TELEGRAM_STREAM_MIN_INTERVAL_MS) return;
+  session.lastSentAt = now;
+
+  const chunk = splitPlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH)[0] ?? '';
+  if (!chunk) return;
+  if (session.lastChunk === chunk) return;
+  session.lastChunk = chunk;
+
+  if (session.mode === 'draft') {
+    try {
+      await (telegrafBot.telegram as unknown as { callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown> })
+        .callApi('sendMessageDraft', {
+          chat_id: chatId,
+          draft_id: draftId,
+          text: chunk,
+          message_thread_id: session.messageThreadId
+        });
+      session.started = true;
+      return;
+    } catch (err) {
+      logger.warn({ chatId, err }, 'sendMessageDraft failed; switching to edit fallback');
+      session.mode = 'edit';
+    }
+  }
+
+  if (!session.messageId) {
+    try {
+      const payload: Record<string, unknown> = {};
+      if (session.messageThreadId) payload.message_thread_id = session.messageThreadId;
+      const sent = await telegrafBot.telegram.sendMessage(chatId, chunk, payload);
+      session.messageId = sent.message_id;
+      session.started = true;
+      return;
+    } catch (err) {
+      logger.warn({ chatId, err }, 'Failed to send draft placeholder');
+      return;
+    }
+  }
+
+  try {
+    await telegrafBot.telegram.editMessageText(chatId, session.messageId, undefined, chunk);
+    session.started = true;
+  } catch (err) {
+    logger.debug({ chatId, err }, 'Failed to edit draft message');
+  }
+}
+
+function isTelegramNotModifiedError(err: unknown): boolean {
+  const description = (err as { response?: { description?: unknown } })?.response?.description;
+  if (typeof description === 'string' && description.toLowerCase().includes('message is not modified')) {
+    return true;
+  }
+  return false;
+}
+
+async function finalizeStreamedMessage(msg: TelegramMessage, draftId: number | null, text: string): Promise<void> {
+  if (!draftId) {
+    await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId });
+    return;
+  }
+  const key = getDraftKey(msg.chatId, draftId);
+  const session = draftSessions.get(key);
+  if (!session) {
+    await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId });
+    return;
+  }
+
+  if (session.mode === 'edit' && session.messageId) {
+    const chunks = formatTelegramMessage(text, TELEGRAM_MAX_MESSAGE_LENGTH);
+    if (chunks.length === 0) {
+      clearDraftSession(msg.chatId, draftId);
+      return;
+    }
+    const firstChunk = chunks[0];
+    const firstChunkMatches = session.lastChunk === firstChunk;
+    try {
+      if (!firstChunkMatches) {
+        await telegrafBot.telegram.editMessageText(
+          msg.chatId,
+          session.messageId,
+          undefined,
+          firstChunk,
+          { parse_mode: TELEGRAM_PARSE_MODE }
+        );
+      }
+      for (let i = firstChunkMatches ? 1 : 1; i < chunks.length; i += 1) {
+        await sendMessage(msg.chatId, chunks[i], { messageThreadId: msg.messageThreadId });
+      }
+      clearDraftSession(msg.chatId, draftId);
+      return;
+    } catch (err) {
+      if (isTelegramNotModifiedError(err)) {
+        for (let i = firstChunkMatches ? 1 : 1; i < chunks.length; i += 1) {
+          await sendMessage(msg.chatId, chunks[i], { messageThreadId: msg.messageThreadId });
+        }
+        clearDraftSession(msg.chatId, draftId);
+        return;
+      }
+      logger.warn({ chatId: msg.chatId, err }, 'Failed to finalize streamed edit; sending new message');
+    }
+  }
+
+  await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId });
+  clearDraftSession(msg.chatId, draftId);
 }
 
 interface TelegramMessage {
@@ -430,18 +685,29 @@ interface TelegramMessage {
   content: string;
   timestamp: string;
   isGroup: boolean;
+  chatType: string;
+  messageThreadId?: number;
 }
 
 function enqueueMessage(msg: TelegramMessage): void {
+  if (PREEMPT_ON_NEW_MESSAGE) {
+    const inFlight = inFlightRuns.get(msg.chatId);
+    if (inFlight && !inFlight.controller.signal.aborted) {
+      logger.warn({ chatId: msg.chatId }, 'Preempting in-flight agent run');
+      inFlight.controller.abort();
+    }
+  }
   const existing = messageQueues.get(msg.chatId);
   if (existing) {
     existing.pendingMessage = msg;
     if (!existing.inFlight) {
       void drainQueue(msg.chatId);
     }
+    setMessageQueueDepth(messageQueues.size);
     return;
   }
   messageQueues.set(msg.chatId, { inFlight: false, pendingMessage: msg });
+  setMessageQueueDepth(messageQueues.size);
   void drainQueue(msg.chatId);
 }
 
@@ -465,6 +731,7 @@ async function drainQueue(chatId: string): Promise<void> {
     } else {
       messageQueues.delete(chatId);
     }
+    setMessageQueueDepth(messageQueues.size);
   }
 }
 
@@ -475,6 +742,7 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
     return false;
   }
   recordMessage('telegram');
+  setLastMessageTime(msg.timestamp);
 
   // Get all messages since last agent interaction so the session has full context
   const chatState = getChatState(msg.chatId);
@@ -502,293 +770,401 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
-    return `<message sender="${escapeXml(m.sender_name)}" sender_id="${escapeXml(m.sender)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
+    const safeContent = clampInputMessage(m.content, INPUT_MESSAGE_MAX_CHARS);
+    return `<message sender="${escapeXml(m.sender_name)}" sender_id="${escapeXml(m.sender)}" time="${m.timestamp}">${escapeXml(safeContent)}</message>`;
   });
-  const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
-  const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const traceTimestamp = new Date().toISOString();
-  const traceBase = {
-    trace_id: traceId,
-    timestamp: traceTimestamp,
-    created_at: Date.now(),
-    chat_id: msg.chatId,
-    group_folder: group.folder,
-    user_id: msg.senderId,
-    input_text: prompt,
-    source: 'dotclaw'
-  } as const;
+  const prompt = `<messages>
+${lines.join('\n')}
+</messages>`;
 
-  const recordTrace = (output: ContainerOutput | null, errorMessage?: string) => {
-    const pricing = output?.model ? getModelPricing(modelRegistry, output.model) : modelPricing;
-    const cost = computeCostUSD(output?.tokens_prompt, output?.tokens_completion, pricing);
-    writeTrace({
-      ...traceBase,
-      output_text: output?.result ?? null,
-      model_id: output?.model || 'unknown',
-      prompt_pack_versions: output?.prompt_pack_versions,
-      memory_summary: output?.memory_summary,
-      memory_facts: output?.memory_facts,
-      memory_recall: memoryRecall,
-      tool_calls: output?.tool_calls,
-      latency_ms: output?.latency_ms,
-      tokens_prompt: output?.tokens_prompt,
-      tokens_completion: output?.tokens_completion,
-      cost_prompt_usd: cost?.prompt,
-      cost_completion_usd: cost?.completion,
-      cost_total_usd: cost?.total,
-      memory_recall_count: output?.memory_recall_count,
-      session_recall_count: output?.session_recall_count,
-      memory_items_upserted: output?.memory_items_upserted,
-      memory_items_extracted: output?.memory_items_extracted,
-      error_code: errorMessage || (output?.status === 'error' ? output?.error : undefined)
+  const lastMessage = missedMessages[missedMessages.length - 1];
+  if (lastMessage && shouldRunInBackground(lastMessage.content)) {
+    logger.info({ group: group.name }, 'Routing message to background task');
+    updateChatState(msg.chatId, lastMessage.timestamp, lastMessage.id);
+    await sendMessage(msg.chatId, BACKGROUND_ACK_MESSAGE, { messageThreadId: msg.messageThreadId });
+    void runBackgroundTask({
+      msg,
+      group,
+      prompt,
+      missedMessages
     });
-  };
+    return true;
+  }
+
+  const traceBase = createTraceBase({
+    chatId: msg.chatId,
+    groupFolder: group.folder,
+    userId: msg.senderId,
+    inputText: prompt,
+    source: 'dotclaw'
+  });
 
   logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
 
   await setTyping(msg.chatId);
-  const recallQuery = missedMessages.map(m => m.content).join('\n');
-  const memoryRecall = await buildHybridMemoryRecall({
-    groupFolder: group.folder,
-    userId: msg.senderId,
-    query: recallQuery || msg.content,
-    maxResults: MEMORY_RECALL_MAX_RESULTS,
-    maxTokens: MEMORY_RECALL_MAX_TOKENS
-  });
-  const userProfile = buildUserProfile({
-    groupFolder: group.folder,
-    userId: msg.senderId
-  });
-  const memoryStats = getMemoryStats({
-    groupFolder: group.folder,
-    userId: msg.senderId
-  });
-  const behaviorConfig = loadPersonalizedBehaviorConfig({
-    groupFolder: group.folder,
-    userId: msg.senderId
-  });
-  const baseToolPolicy = getEffectiveToolPolicy({
-    groupFolder: group.folder,
-    userId: msg.senderId
-  });
-  const toolPolicy = applyToolBudgets({
-    groupFolder: group.folder,
-    userId: msg.senderId,
-    toolPolicy: baseToolPolicy
-  });
-  const toolReliability = getToolReliability({ groupFolder: group.folder, limit: 200 })
-    .map(row => ({
-      name: row.tool_name,
-      success_rate: row.total > 0 ? row.ok_count / row.total : 0,
-      count: row.total,
-      avg_duration_ms: row.avg_duration_ms
-    }));
-  const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
-  const modelRegistry = loadModelRegistry(defaultModel);
-  const resolvedModel = resolveModel({
-    groupFolder: group.folder,
-    userId: msg.senderId,
-    defaultModel
-  });
-  const tokenEstimate = getTokenEstimateConfig(resolvedModel.override);
-  const modelPricing = getModelPricing(modelRegistry, resolvedModel.model);
+  const recallQuery = missedMessages.map(entry => entry.content).join('\n');
+
+  const draftSession = registerDraftSession(msg);
+  const draftId = draftSession?.draftId ?? null;
+  const streamingEnabled = Boolean(draftSession && draftId);
 
   let output: ContainerOutput | null = null;
+  let context: AgentContext | null = null;
+  let errorMessage: string | null = null;
+
   const progressNotifier = createProgressNotifier({
-    enabled: PROGRESS_ENABLED,
+    enabled: PROGRESS_ENABLED && !streamingEnabled,
     initialDelayMs: PROGRESS_INITIAL_MS,
     intervalMs: PROGRESS_INTERVAL_MS,
     maxUpdates: PROGRESS_MAX_UPDATES,
     messages: PROGRESS_MESSAGES,
-    send: (text) => sendMessage(msg.chatId, text),
+    send: async (text) => { await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId }); },
     onError: (err) => logger.debug({ chatId: msg.chatId, err }, 'Failed to send progress update')
   });
   progressNotifier.start();
   try {
-    output = await runAgent(group, prompt, msg.chatId, {
+    const execution = await executeAgentRun({
+      group,
+      prompt,
+      chatJid: msg.chatId,
       userId: msg.senderId,
       userName: msg.senderName,
-      memoryRecall,
-      userProfile,
-      memoryStats,
-      tokenEstimate,
-      toolReliability,
-      behaviorConfig: behaviorConfig as unknown as Record<string, unknown>,
-      toolPolicy: toolPolicy as Record<string, unknown>,
-      modelOverride: resolvedModel.model,
-      modelContextTokens: resolvedModel.override?.context_window,
-      modelMaxOutputTokens: resolvedModel.override?.max_output_tokens,
-      modelTemperature: resolvedModel.override?.temperature
+      recallQuery: recallQuery || msg.content,
+      recallMaxResults: MEMORY_RECALL_MAX_RESULTS,
+      recallMaxTokens: MEMORY_RECALL_MAX_TOKENS,
+      sessionId: sessions[group.folder],
+      onSessionUpdate: (sessionId) => { sessions[group.folder] = sessionId; },
+      streaming: streamingEnabled && draftId
+        ? {
+          enabled: true,
+          draftId,
+          minIntervalMs: TELEGRAM_STREAM_MIN_INTERVAL_MS,
+          minChars: TELEGRAM_STREAM_MIN_CHARS
+        }
+        : undefined,
+      availableGroups: buildAvailableGroupsSnapshot()
     });
+    output = execution.output;
+    context = execution.context;
+
+    if (output.status === 'error') {
+      errorMessage = output.error || 'Unknown error';
+    }
   } catch (err) {
+    if (err instanceof AgentExecutionError) {
+      context = err.context;
+      errorMessage = err.message;
+    } else {
+      errorMessage = err instanceof Error ? err.message : String(err);
+    }
     logger.error({ group: group.name, err }, 'Agent error');
-    recordError('agent');
-    recordTrace(null, err instanceof Error ? err.message : String(err));
-    await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
-    return false;
   } finally {
     progressNotifier.stop();
   }
 
   if (!output) {
-    recordTrace(null, 'No output from agent');
+    const message = errorMessage || 'No output from agent';
+    if (context) {
+      recordAgentTelemetry({
+        traceBase,
+        output: null,
+        context,
+        metricsSource: 'telegram',
+        toolAuditSource: 'message',
+        errorMessage: message,
+        errorType: 'agent'
+      });
+    } else {
+      recordError('agent');
+      writeTrace({
+        trace_id: traceBase.trace_id,
+        timestamp: traceBase.timestamp,
+        created_at: traceBase.created_at,
+        chat_id: traceBase.chat_id,
+        group_folder: traceBase.group_folder,
+        user_id: traceBase.user_id,
+        input_text: traceBase.input_text,
+        output_text: null,
+        model_id: 'unknown',
+        memory_recall: [],
+        error_code: message,
+        source: traceBase.source
+      });
+    }
+    const userMessage = humanizeError(errorMessage || 'Unknown error');
+    await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
+    if (draftId) {
+      clearDraftSession(msg.chatId, draftId);
+    }
     return false;
   }
 
   if (output.status === 'error') {
+    if (context) {
+      recordAgentTelemetry({
+        traceBase,
+        output,
+        context,
+        metricsSource: 'telegram',
+        toolAuditSource: 'message',
+        errorMessage: errorMessage || output.error || 'Unknown error',
+        errorType: 'agent'
+      });
+    }
     logger.error({ group: group.name, error: output.error }, 'Container agent error');
-    recordError('agent');
-    recordTrace(output, output.error);
-    await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
+    const userMessage = humanizeError(errorMessage || output.error || 'Unknown error');
+    await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
+    if (draftId) {
+      clearDraftSession(msg.chatId, draftId);
+    }
     return false;
   }
 
-  const lastMessage = missedMessages[missedMessages.length - 1];
   if (lastMessage) {
     updateChatState(msg.chatId, lastMessage.timestamp, lastMessage.id);
   }
-  saveState();
 
   if (output.result && output.result.trim()) {
-    await sendMessage(msg.chatId, output.result);
+    let sentMessageId: string | undefined;
+    if (streamingEnabled && draftId) {
+      await finalizeStreamedMessage(msg, draftId, output.result);
+      // Note: streaming doesn't easily give us the message ID
+    } else {
+      const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
+      sentMessageId = sendResult.messageId;
+    }
+    // Link the sent message to the trace for feedback tracking
+    if (sentMessageId) {
+      try {
+        linkMessageToTrace(sentMessageId, msg.chatId, traceBase.trace_id);
+      } catch {
+        // Don't fail if linking fails
+      }
+    }
   } else if (output.tool_calls && output.tool_calls.length > 0) {
     await sendMessage(
       msg.chatId,
-      'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.'
+      'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
+      { messageThreadId: msg.messageThreadId }
     );
+    if (draftId) {
+      clearDraftSession(msg.chatId, draftId);
+    }
   } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
+    if (draftId) {
+      clearDraftSession(msg.chatId, draftId);
+    }
   }
 
-  recordTrace(output);
-  if (output.latency_ms) {
-    recordLatency(output.latency_ms);
-  }
-  if (Number.isFinite(output.tokens_prompt) || Number.isFinite(output.tokens_completion)) {
-    recordTokenUsage(output.model || resolvedModel.model, 'telegram', output.tokens_prompt || 0, output.tokens_completion || 0);
-    const pricing = getModelPricing(modelRegistry, output.model || resolvedModel.model);
-    const cost = computeCostUSD(output.tokens_prompt, output.tokens_completion, pricing);
-    if (cost) {
-      recordCost(output.model || resolvedModel.model, 'telegram', cost.total);
-    }
-  }
-  if (Number.isFinite(output.memory_recall_count)) {
-    recordMemoryRecall('telegram', output.memory_recall_count || 0);
-  }
-  if (Number.isFinite(output.memory_items_upserted)) {
-    recordMemoryUpsert('telegram', output.memory_items_upserted || 0);
-  }
-  if (Number.isFinite(output.memory_items_extracted)) {
-    recordMemoryExtract('telegram', output.memory_items_extracted || 0);
-  }
-  if (output.tool_calls && output.tool_calls.length > 0) {
-    logToolCalls({
-      traceId,
-      chatJid: msg.chatId,
-      groupFolder: group.folder,
-      userId: msg.senderId,
-      toolCalls: output.tool_calls,
-      source: 'message'
+  if (context) {
+    recordAgentTelemetry({
+      traceBase,
+      output,
+      context,
+      metricsSource: 'telegram',
+      toolAuditSource: 'message'
     });
-    for (const call of output.tool_calls) {
-      recordToolCall(call.name, call.ok);
-    }
   }
 
   return true;
 }
 
-async function runAgent(
-  group: RegisteredGroup,
-  prompt: string,
-  chatId: string,
-  options?: {
-    userId?: string;
-    userName?: string;
-    memoryRecall?: string[];
-    userProfile?: string | null;
-    memoryStats?: { total: number; user: number; group: number; global: number };
-    tokenEstimate?: { tokens_per_char: number; tokens_per_message: number; tokens_per_request: number };
-    toolReliability?: Array<{ name: string; success_rate: number; count: number; avg_duration_ms: number | null }>;
-    behaviorConfig?: Record<string, unknown>;
-    toolPolicy?: Record<string, unknown>;
-    modelOverride?: string;
-    modelContextTokens?: number;
-    modelMaxOutputTokens?: number;
-    modelTemperature?: number;
+
+async function runBackgroundTask(params: {
+  msg: TelegramMessage;
+  group: RegisteredGroup;
+  prompt: string;
+  missedMessages: NewMessage[];
+}): Promise<void> {
+  const { msg, group, prompt, missedMessages } = params;
+  const traceBase = createTraceBase({
+    chatId: msg.chatId,
+    groupFolder: group.folder,
+    userId: msg.senderId,
+    inputText: prompt,
+    source: 'dotclaw-background'
+  });
+
+  const recallQuery = missedMessages.map(entry => entry.content).join('\n');
+
+  const runId = `bg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const abortController = new AbortController();
+  if (PREEMPT_ON_NEW_MESSAGE) {
+    inFlightRuns.set(msg.chatId, { controller: abortController, runId });
   }
-): Promise<ContainerOutput> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
-  writeTasksSnapshot(group.folder, isMain, tasks.map(t => ({
-    id: t.id,
-    groupFolder: t.group_folder,
-    prompt: t.prompt,
-    schedule_type: t.schedule_type,
-    schedule_value: t.schedule_value,
-    status: t.status,
-    next_run: t.next_run,
-    state_json: t.state_json ?? null,
-    retry_count: t.retry_count ?? 0,
-    last_error: t.last_error ?? null
-  })));
-
-  // For Telegram, we don't have dynamic group discovery like WhatsApp
-  // Pass registered groups for main (admin) context
-  const availableGroups = Object.entries(registeredGroups).map(([jid, info]) => ({
-    jid,
-    name: info.name,
-    lastActivity: getChatState(jid)?.last_agent_timestamp || info.added_at,
-    isRegistered: true
-  }));
-  writeGroupsSnapshot(group.folder, isMain, availableGroups);
+  let output: ContainerOutput | null = null;
+  let context: AgentContext | null = null;
+  let errorMessage: string | null = null;
 
   try {
-    const output = await runWithAgentSemaphore(() =>
-      withGroupLock(group.folder, () =>
-        runContainerAgent(group, {
-          prompt,
-          sessionId,
-          groupFolder: group.folder,
-          chatJid: chatId,
-          isMain,
-          userId: options?.userId,
-          userName: options?.userName,
-          memoryRecall: options?.memoryRecall,
-        userProfile: options?.userProfile ?? null,
-        memoryStats: options?.memoryStats,
-        tokenEstimate: options?.tokenEstimate,
-        toolReliability: options?.toolReliability,
-        behaviorConfig: options?.behaviorConfig,
-          toolPolicy: options?.toolPolicy,
-          modelOverride: options?.modelOverride,
-          modelContextTokens: options?.modelContextTokens,
-          modelMaxOutputTokens: options?.modelMaxOutputTokens,
-          modelTemperature: options?.modelTemperature
-        })
-      )
-    );
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setGroupSession(group.folder, output.newSessionId);
-      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+    const execution = await executeAgentRun({
+      group,
+      prompt,
+      chatJid: msg.chatId,
+      userId: msg.senderId,
+      userName: msg.senderName,
+      recallQuery: recallQuery || msg.content,
+      recallMaxResults: MEMORY_RECALL_MAX_RESULTS,
+      recallMaxTokens: MEMORY_RECALL_MAX_TOKENS,
+      toolDeny: BACKGROUND_TOOL_DENY,
+      sessionId: runId,
+      persistSession: false,
+      useGroupLock: false,
+      abortSignal: abortController.signal,
+      isBackgroundTask: true,
+      availableGroups: buildAvailableGroupsSnapshot()
+    });
+    output = execution.output;
+    context = execution.context;
+    if (output.status === 'error') {
+      errorMessage = output.error || 'Unknown error';
     }
-
-    return output;
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    logger.error({ group: group.name, err }, 'Agent error');
-    return {
-      status: 'error',
-      result: null,
-      error: errorMessage
-    };
+    if (err instanceof AgentExecutionError) {
+      context = err.context;
+      errorMessage = err.message;
+    } else {
+      errorMessage = err instanceof Error ? err.message : String(err);
+    }
+    if (abortController.signal.aborted || isPreemptedError(err)) {
+      if (context) {
+        recordAgentTelemetry({
+          traceBase,
+          output,
+          context,
+          metricsSource: 'telegram',
+          toolAuditSource: 'background',
+          errorMessage: 'preempted'
+        });
+      } else {
+        writeTrace({
+          trace_id: traceBase.trace_id,
+          timestamp: traceBase.timestamp,
+          created_at: traceBase.created_at,
+          chat_id: traceBase.chat_id,
+          group_folder: traceBase.group_folder,
+          user_id: traceBase.user_id,
+          input_text: traceBase.input_text,
+          output_text: null,
+          model_id: 'unknown',
+          memory_recall: [],
+          error_code: 'preempted',
+          source: traceBase.source
+        });
+      }
+      logger.warn({ chatId: msg.chatId }, 'Background run preempted; skipping response');
+      return;
+    }
+    logger.error({ group: group.name, err }, 'Background agent error');
+  } finally {
+    if (PREEMPT_ON_NEW_MESSAGE) {
+      const current = inFlightRuns.get(msg.chatId);
+      if (current?.runId === runId) {
+        inFlightRuns.delete(msg.chatId);
+      }
+    }
+  }
+
+  if (!output) {
+    if (context) {
+      recordAgentTelemetry({
+        traceBase,
+        output: null,
+        context,
+        metricsSource: 'telegram',
+        toolAuditSource: 'background',
+        errorMessage: errorMessage || 'No output from background agent',
+        errorType: 'agent'
+      });
+    } else {
+      recordError('agent');
+      writeTrace({
+        trace_id: traceBase.trace_id,
+        timestamp: traceBase.timestamp,
+        created_at: traceBase.created_at,
+        chat_id: traceBase.chat_id,
+        group_folder: traceBase.group_folder,
+        user_id: traceBase.user_id,
+        input_text: traceBase.input_text,
+        output_text: null,
+        model_id: 'unknown',
+        memory_recall: [],
+        error_code: errorMessage || 'No output from background agent',
+        source: traceBase.source
+      });
+    }
+    return;
+  }
+
+  if (output.status === 'error') {
+    if (abortController.signal.aborted || isPreemptedError(output.error)) {
+      if (context) {
+        recordAgentTelemetry({
+          traceBase,
+          output,
+          context,
+          metricsSource: 'telegram',
+          toolAuditSource: 'background',
+          errorMessage: 'preempted'
+        });
+      }
+      logger.warn({ chatId: msg.chatId }, 'Background run preempted; skipping response');
+      return;
+    }
+    if (context) {
+      recordAgentTelemetry({
+        traceBase,
+        output,
+        context,
+        metricsSource: 'telegram',
+        toolAuditSource: 'background',
+        errorMessage: errorMessage || output.error || 'Unknown error',
+        errorType: 'agent'
+      });
+    }
+    logger.error({ group: group.name, error: output.error }, 'Background agent error');
+    const userMessage = humanizeError(errorMessage || output.error || 'Unknown error');
+    await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
+    return;
+  }
+
+  if (output.result && output.result.trim()) {
+    const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
+    // Link the sent message to the trace for feedback tracking
+    if (sendResult.messageId) {
+      try {
+        linkMessageToTrace(sendResult.messageId, msg.chatId, traceBase.trace_id);
+      } catch {
+        // Don't fail if linking fails
+      }
+    }
+  } else if (output.tool_calls && output.tool_calls.length > 0) {
+    await sendMessage(
+      msg.chatId,
+      'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
+      { messageThreadId: msg.messageThreadId }
+    );
+  } else {
+    await sendMessage(
+      msg.chatId,
+      "I wasn't able to generate a response this time. Please try again or rephrase your request.",
+      { messageThreadId: msg.messageThreadId }
+    );
+  }
+
+  if (context) {
+    recordAgentTelemetry({
+      traceBase,
+      output,
+      context,
+      metricsSource: 'telegram',
+      toolAuditSource: 'background'
+    });
   }
 }
+
 
 function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
@@ -829,12 +1205,21 @@ function startIpcWatcher(): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if ((data.type === 'message' || data.type === 'message_draft') && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-                  await sendMessage(data.chatJid, data.text);
-                  logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
+                  if (data.type === 'message_draft') {
+                    const draftId = Number.isFinite(data.draftId) ? Number(data.draftId) : NaN;
+                    if (!Number.isFinite(draftId)) {
+                      logger.warn({ chatJid: data.chatJid, sourceGroup }, 'IPC draft missing draftId');
+                    } else {
+                      await sendDraftUpdate(data.chatJid, draftId, data.text);
+                    }
+                  } else {
+                    await sendMessage(data.chatJid, data.text);
+                    logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
+                  }
                 } else {
                   logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
                 }
@@ -961,134 +1346,82 @@ async function runHeartbeatOnce(): Promise<void> {
     return;
   }
   const [chatId, group] = entry;
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
   const prompt = [
     '[HEARTBEAT]',
     'You are running automatically. Review scheduled tasks, pending reminders, and long-running work.',
     'If you need to communicate, use mcp__dotclaw__send_message. Otherwise, take no user-visible action.'
-  ].join(' ');
+  ].join('\n');
 
-  const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const traceTimestamp = new Date().toISOString();
-
-  const memoryRecall = await buildHybridMemoryRecall({
+  const traceBase = createTraceBase({
+    chatId,
     groupFolder: group.folder,
     userId: null,
-    query: prompt,
-    maxResults: Math.max(4, MEMORY_RECALL_MAX_RESULTS - 2),
-    maxTokens: Math.max(600, MEMORY_RECALL_MAX_TOKENS - 200)
-  });
-  const memoryStats = getMemoryStats({
-    groupFolder: group.folder,
-    userId: null
-  });
-  const behaviorConfig = loadPersonalizedBehaviorConfig({
-    groupFolder: group.folder,
-    userId: null
-  });
-  const baseToolPolicy = getEffectiveToolPolicy({
-    groupFolder: group.folder,
-    userId: null
-  });
-  const toolPolicy = applyToolBudgets({
-    groupFolder: group.folder,
-    userId: null,
-    toolPolicy: baseToolPolicy
-  });
-  const toolReliability = getToolReliability({ groupFolder: group.folder, limit: 200 })
-    .map(row => ({
-      name: row.tool_name,
-      success_rate: row.total > 0 ? row.ok_count / row.total : 0,
-      count: row.total,
-      avg_duration_ms: row.avg_duration_ms
-    }));
-  const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
-  const modelRegistry = loadModelRegistry(defaultModel);
-  const resolvedModel = resolveModel({
-    groupFolder: group.folder,
-    userId: null,
-    defaultModel
-  });
-  const tokenEstimate = getTokenEstimateConfig(resolvedModel.override);
-
-  const sessionId = sessions[group.folder];
-  const output = await runWithAgentSemaphore(() =>
-    withGroupLock(group.folder, () =>
-      runContainerAgent(group, {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid: chatId,
-        isMain,
-        isScheduledTask: true,
-        memoryRecall,
-        userProfile: null,
-        memoryStats,
-        tokenEstimate,
-        toolReliability,
-        behaviorConfig: behaviorConfig as unknown as Record<string, unknown>,
-        toolPolicy: toolPolicy as Record<string, unknown>,
-        modelOverride: resolvedModel.model,
-        modelContextTokens: resolvedModel.override?.context_window,
-        modelMaxOutputTokens: resolvedModel.override?.max_output_tokens,
-        modelTemperature: resolvedModel.override?.temperature
-      })
-    )
-  );
-
-  if (output?.newSessionId) {
-    sessions[group.folder] = output.newSessionId;
-    setGroupSession(group.folder, output.newSessionId);
-    saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-  }
-
-  const cost = computeCostUSD(
-    output?.tokens_prompt,
-    output?.tokens_completion,
-    getModelPricing(modelRegistry, output?.model || resolvedModel.model)
-  );
-
-  writeTrace({
-    trace_id: traceId,
-    timestamp: traceTimestamp,
-    created_at: Date.now(),
-    chat_id: chatId,
-    group_folder: group.folder,
-    input_text: prompt,
-    output_text: output?.result ?? null,
-    model_id: output?.model || 'unknown',
-    prompt_pack_versions: output?.prompt_pack_versions,
-    memory_summary: output?.memory_summary,
-    memory_facts: output?.memory_facts,
-    tool_calls: output?.tool_calls,
-    latency_ms: output?.latency_ms,
-    tokens_prompt: output?.tokens_prompt,
-    tokens_completion: output?.tokens_completion,
-    cost_prompt_usd: cost?.prompt,
-    cost_completion_usd: cost?.completion,
-    cost_total_usd: cost?.total,
-    memory_recall_count: output?.memory_recall_count,
-    session_recall_count: output?.session_recall_count,
-    memory_items_upserted: output?.memory_items_upserted,
-    memory_items_extracted: output?.memory_items_extracted,
-    error_code: output?.status === 'error' ? output?.error : undefined,
+    inputText: prompt,
     source: 'dotclaw-heartbeat'
   });
 
-  if (output?.tool_calls && output.tool_calls.length > 0) {
-    logToolCalls({
-      traceId,
+  let output: ContainerOutput | null = null;
+  let context: AgentContext | null = null;
+  let errorMessage: string | null = null;
+
+  const recallMaxResults = Math.max(4, MEMORY_RECALL_MAX_RESULTS - 2);
+  const recallMaxTokens = Math.max(600, MEMORY_RECALL_MAX_TOKENS - 200);
+
+  try {
+    const execution = await executeAgentRun({
+      group,
+      prompt,
       chatJid: chatId,
-      groupFolder: group.folder,
       userId: null,
-      toolCalls: output.tool_calls,
-      source: 'heartbeat'
+      recallQuery: prompt,
+      recallMaxResults,
+      recallMaxTokens,
+      sessionId: sessions[group.folder],
+      onSessionUpdate: (sessionId) => { sessions[group.folder] = sessionId; },
+      isScheduledTask: true,
+      availableGroups: buildAvailableGroupsSnapshot()
     });
-    for (const call of output.tool_calls) {
-      recordToolCall(call.name, call.ok);
+    output = execution.output;
+    context = execution.context;
+    if (output.status === 'error') {
+      errorMessage = output.error || 'Unknown error';
     }
+  } catch (err) {
+    if (err instanceof AgentExecutionError) {
+      context = err.context;
+      errorMessage = err.message;
+    } else {
+      errorMessage = err instanceof Error ? err.message : String(err);
+    }
+    logger.error({ err }, 'Heartbeat run failed');
+  }
+
+  if (context) {
+    recordAgentTelemetry({
+      traceBase,
+      output,
+      context,
+      toolAuditSource: 'heartbeat',
+      errorMessage: errorMessage ?? undefined
+    });
+  } else if (errorMessage) {
+    writeTrace({
+      trace_id: traceBase.trace_id,
+      timestamp: traceBase.timestamp,
+      created_at: traceBase.created_at,
+      chat_id: traceBase.chat_id,
+      group_folder: traceBase.group_folder,
+      user_id: traceBase.user_id,
+      input_text: traceBase.input_text,
+      output_text: null,
+      model_id: 'unknown',
+      memory_recall: [],
+      error_code: errorMessage,
+      source: traceBase.source
+    });
   }
 }
+
 
 function startHeartbeatLoop(): void {
   if (!HEARTBEAT_ENABLED) return;
@@ -1327,7 +1660,7 @@ async function processTaskIpc(
         break;
       }
       {
-        const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+        const defaultModel = runtime.host.defaultModel;
         const config = loadModelRegistry(defaultModel);
         const nextModel = data.model.trim();
         if (config.allowlist && config.allowlist.length > 0 && !config.allowlist.includes(nextModel)) {
@@ -1466,7 +1799,7 @@ function formatGroups(groups: Array<{ chat_id: string; name: string; folder: str
 }
 
 function applyModelOverride(params: { model: string; scope: 'global' | 'group' | 'user'; targetId?: string }): { ok: boolean; error?: string } {
-  const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+  const defaultModel = runtime.host.defaultModel;
   const config = loadModelRegistry(defaultModel);
   const nextModel = params.model.trim();
   if (config.allowlist && config.allowlist.length > 0 && !config.allowlist.includes(nextModel)) {
@@ -1501,13 +1834,16 @@ async function handleAdminCommand(params: {
   senderName: string;
   content: string;
   botUsername?: string;
+  messageThreadId?: number;
 }): Promise<boolean> {
   const parsed = parseAdminCommand(params.content, params.botUsername);
   if (!parsed) return false;
 
+  const reply = (text: string) => sendMessage(params.chatId, text, { messageThreadId: params.messageThreadId });
+
   const group = registeredGroups[params.chatId];
   if (!group) {
-    await sendMessage(params.chatId, 'This chat is not registered with DotClaw.');
+    await reply('This chat is not registered with DotClaw.');
     return true;
   }
 
@@ -1517,12 +1853,12 @@ async function handleAdminCommand(params: {
 
   const requireMain = (name: string): boolean => {
     if (isMain) return false;
-    sendMessage(params.chatId, `${name} is only available in the main group.`).catch(() => undefined);
+    reply(`${name} is only available in the main group.`).catch(() => undefined);
     return true;
   };
 
   if (command === 'help') {
-    await sendMessage(params.chatId, [
+    await reply([
       'DotClaw admin commands:',
       '- `/dotclaw help`',
       '- `/dotclaw groups` (main only)',
@@ -1540,25 +1876,25 @@ async function handleAdminCommand(params: {
 
   if (command === 'groups') {
     if (requireMain('Listing groups')) return true;
-    await sendMessage(params.chatId, formatGroups(listRegisteredGroups()));
+    await reply(formatGroups(listRegisteredGroups()));
     return true;
   }
 
   if (command === 'add-group') {
     if (requireMain('Adding groups')) return true;
     if (args.length < 1) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw add-group <chat_id> <name> [folder]');
+      await reply('Usage: /dotclaw add-group <chat_id> <name> [folder]');
       return true;
     }
     const jid = args[0];
     if (registeredGroups[jid]) {
-      await sendMessage(params.chatId, 'That chat id is already registered.');
+      await reply('That chat id is already registered.');
       return true;
     }
     const name = args[1] || `group-${jid}`;
     const folder = args[2] || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
     if (!isSafeGroupFolder(folder, GROUPS_DIR)) {
-      await sendMessage(params.chatId, 'Invalid folder name. Use lowercase letters, numbers, and dashes only.');
+      await reply('Invalid folder name. Use lowercase letters, numbers, and dashes only.');
       return true;
     }
     registerGroup(jid, {
@@ -1566,29 +1902,29 @@ async function handleAdminCommand(params: {
       folder: folder || `group-${jid}`,
       added_at: new Date().toISOString()
     });
-    await sendMessage(params.chatId, `Registered group "${name}" with folder "${folder}".`);
+    await reply(`Registered group "${name}" with folder "${folder}".`);
     return true;
   }
 
   if (command === 'remove-group') {
     if (requireMain('Removing groups')) return true;
     if (args.length < 1) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw remove-group <chat_id|name|folder>');
+      await reply('Usage: /dotclaw remove-group <chat_id|name|folder>');
       return true;
     }
     const result = unregisterGroup(args.join(' '));
     if (!result.ok) {
-      await sendMessage(params.chatId, `Failed to remove group: ${result.error || 'unknown error'}`);
+      await reply(`Failed to remove group: ${result.error || 'unknown error'}`);
       return true;
     }
-    await sendMessage(params.chatId, `Removed group "${result.group?.name}" (${result.group?.folder}).`);
+    await reply(`Removed group "${result.group?.name}" (${result.group?.folder}).`);
     return true;
   }
 
   if (command === 'set-model') {
     if (requireMain('Setting models')) return true;
     if (args.length < 1) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw set-model <model> [global|group|user] [target_id]');
+      await reply('Usage: /dotclaw set-model <model> [global|group|user] [target_id]');
       return true;
     }
     const model = args[0];
@@ -1599,10 +1935,10 @@ async function handleAdminCommand(params: {
     const targetId = args[2] || (scope === 'group' ? group.folder : scope === 'user' ? params.senderId : undefined);
     const result = applyModelOverride({ model, scope, targetId });
     if (!result.ok) {
-      await sendMessage(params.chatId, `Failed to set model: ${result.error || 'unknown error'}`);
+      await reply(`Failed to set model: ${result.error || 'unknown error'}`);
       return true;
     }
-    await sendMessage(params.chatId, `Model set to ${model} (${scope}${targetId ? `:${targetId}` : ''}).`);
+    await reply(`Model set to ${model} (${scope}${targetId ? `:${targetId}` : ''}).`);
     return true;
   }
 
@@ -1610,7 +1946,7 @@ async function handleAdminCommand(params: {
     if (requireMain('Remembering facts')) return true;
     const fact = args.join(' ').trim();
     if (!fact) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw remember <fact>');
+      await reply('Usage: /dotclaw remember <fact>');
       return true;
     }
     const items: MemoryItemInput[] = [{
@@ -1622,14 +1958,14 @@ async function handleAdminCommand(params: {
       tags: ['manual']
     }];
     upsertMemoryItems('global', items, 'admin-command');
-    await sendMessage(params.chatId, 'Saved to global memory.');
+    await reply('Saved to global memory.');
     return true;
   }
 
   if (command === 'style') {
     const style = (args[0] || '').toLowerCase();
     if (!['concise', 'balanced', 'detailed'].includes(style)) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw style <concise|balanced|detailed>');
+      await reply('Usage: /dotclaw style <concise|balanced|detailed>');
       return true;
     }
     const items: MemoryItemInput[] = [{
@@ -1644,7 +1980,7 @@ async function handleAdminCommand(params: {
       metadata: { response_style: style }
     }];
     upsertMemoryItems(group.folder, items, 'admin-command');
-    await sendMessage(params.chatId, `Response style set to ${style}.`);
+    await reply(`Response style set to ${style}.`);
     return true;
   }
 
@@ -1652,7 +1988,7 @@ async function handleAdminCommand(params: {
     const level = (args[0] || '').toLowerCase();
     const bias = level === 'proactive' ? 0.7 : level === 'balanced' ? 0.5 : level === 'conservative' ? 0.3 : null;
     if (bias === null) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw tools <conservative|balanced|proactive>');
+      await reply('Usage: /dotclaw tools <conservative|balanced|proactive>');
       return true;
     }
     const items: MemoryItemInput[] = [{
@@ -1667,7 +2003,7 @@ async function handleAdminCommand(params: {
       metadata: { tool_calling_bias: bias, bias }
     }];
     upsertMemoryItems(group.folder, items, 'admin-command');
-    await sendMessage(params.chatId, `Tool usage bias set to ${level}.`);
+    await reply(`Tool usage bias set to ${level}.`);
     return true;
   }
 
@@ -1675,7 +2011,7 @@ async function handleAdminCommand(params: {
     const level = (args[0] || '').toLowerCase();
     const bias = level === 'high' ? 0.7 : level === 'balanced' ? 0.5 : level === 'low' ? 0.35 : null;
     if (bias === null) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw caution <low|balanced|high>');
+      await reply('Usage: /dotclaw caution <low|balanced|high>');
       return true;
     }
     const items: MemoryItemInput[] = [{
@@ -1690,7 +2026,7 @@ async function handleAdminCommand(params: {
       metadata: { caution_bias: bias, bias }
     }];
     upsertMemoryItems(group.folder, items, 'admin-command');
-    await sendMessage(params.chatId, `Caution bias set to ${level}.`);
+    await reply(`Caution bias set to ${level}.`);
     return true;
   }
 
@@ -1698,7 +2034,7 @@ async function handleAdminCommand(params: {
     const level = (args[0] || '').toLowerCase();
     const threshold = level === 'strict' ? 0.7 : level === 'balanced' ? 0.55 : level === 'loose' ? 0.45 : null;
     if (threshold === null) {
-      await sendMessage(params.chatId, 'Usage: /dotclaw memory <strict|balanced|loose>');
+      await reply('Usage: /dotclaw memory <strict|balanced|loose>');
       return true;
     }
     const items: MemoryItemInput[] = [{
@@ -1713,37 +2049,79 @@ async function handleAdminCommand(params: {
       metadata: { memory_importance_threshold: threshold, threshold }
     }];
     upsertMemoryItems(group.folder, items, 'admin-command');
-    await sendMessage(params.chatId, `Memory strictness set to ${level}.`);
+    await reply(`Memory strictness set to ${level}.`);
     return true;
   }
 
-  await sendMessage(params.chatId, 'Unknown command. Use `/dotclaw help` for options.');
+  await reply('Unknown command. Use `/dotclaw help` for options.');
   return true;
 }
 
 function setupTelegramHandlers(): void {
+  // Handle message reactions (👍/👎 for feedback)
+  telegrafBot.on('message_reaction', async (ctx) => {
+    try {
+      const update = ctx.update as unknown as {
+        message_reaction?: {
+          chat: { id: number };
+          message_id: number;
+          user?: { id: number };
+          new_reaction?: Array<{ type: string; emoji?: string }>;
+        };
+      };
+
+      const reaction = update.message_reaction;
+      if (!reaction) return;
+
+      const emoji = reaction.new_reaction?.[0]?.emoji;
+      if (!emoji || (emoji !== '👍' && emoji !== '👎')) return;
+
+      const chatId = String(reaction.chat.id);
+      const messageId = String(reaction.message_id);
+      const userId = reaction.user?.id ? String(reaction.user.id) : undefined;
+
+      // Look up the trace ID for this message
+      const traceId = getTraceIdForMessage(messageId, chatId);
+      if (!traceId) {
+        logger.debug({ chatId, messageId }, 'No trace found for reacted message');
+        return;
+      }
+
+      // Record the feedback
+      const feedbackType = emoji === '👍' ? 'positive' : 'negative';
+      recordUserFeedback({
+        trace_id: traceId,
+        message_id: messageId,
+        chat_jid: chatId,
+        feedback_type: feedbackType,
+        user_id: userId
+      });
+
+      logger.info({ chatId, messageId, feedbackType, traceId }, 'User feedback recorded');
+    } catch (err) {
+      logger.debug({ err }, 'Error handling message reaction');
+    }
+  });
+
   // Handle all text messages
   telegrafBot.on('message', async (ctx) => {
     if (!ctx.message || !('text' in ctx.message)) return;
 
     const chatId = String(ctx.chat.id);
-    const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-    const isPrivate = ctx.chat.type === 'private';
+    const chatType = ctx.chat.type;
+    const isGroup = chatType === 'group' || chatType === 'supergroup';
+    const isPrivate = chatType === 'private';
     const senderId = String(ctx.from?.id || ctx.chat.id);
     const senderName = ctx.from?.first_name || ctx.from?.username || 'User';
     const content = ctx.message.text;
     const timestamp = new Date(ctx.message.date * 1000).toISOString();
     const messageId = String(ctx.message.message_id);
+    const rawThreadId = (ctx.message as { message_thread_id?: number }).message_thread_id;
+    const messageThreadId = Number.isFinite(rawThreadId) ? Number(rawThreadId) : undefined;
 
     logger.info({ chatId, isGroup, senderName }, `Telegram message: ${content.substring(0, 50)}...`);
 
     try {
-      // Ensure chat exists in database (required for foreign key)
-      const chatName = ctx.chat.type === 'private'
-        ? (ctx.from?.first_name || ctx.from?.username || 'Private Chat')
-        : ('title' in ctx.chat ? ctx.chat.title : 'Group Chat');
-      storeChatMetadata(chatId, timestamp, chatName);
-
       // Store message in database
       storeMessage(
         String(ctx.message.message_id),
@@ -1765,7 +2143,8 @@ function setupTelegramHandlers(): void {
       senderId,
       senderName,
       content,
-      botUsername
+      botUsername,
+      messageThreadId
     });
     if (adminHandled) {
       return;
@@ -1773,9 +2152,21 @@ function setupTelegramHandlers(): void {
 
     const mentioned = isBotMentioned(content, ctx.message.entities, botUsername, botId);
     const replied = isBotReplied(ctx.message, botId);
-    const shouldProcess = isPrivate || mentioned || replied;
+    const group = registeredGroups[chatId];
+    const triggerRegex = isGroup && group?.trigger ? buildTriggerRegex(group.trigger) : null;
+    const triggered = Boolean(triggerRegex && triggerRegex.test(content));
+    const shouldProcess = isPrivate || mentioned || replied || triggered;
 
     if (!shouldProcess) {
+      return;
+    }
+
+    // Rate limiting check
+    const rateCheck = checkRateLimit(senderId);
+    if (!rateCheck.allowed) {
+      const retryAfterSec = Math.ceil((rateCheck.retryAfterMs || 60000) / 1000);
+      logger.warn({ senderId, retryAfterSec }, 'Rate limit exceeded');
+      await sendMessage(chatId, `You're sending messages too quickly. Please wait ${retryAfterSec} seconds and try again.`, { messageThreadId });
       return;
     }
 
@@ -1786,7 +2177,9 @@ function setupTelegramHandlers(): void {
       senderName,
       content,
       timestamp,
-      isGroup
+      isGroup,
+      chatType,
+      messageThreadId
     });
   });
 }
@@ -1811,14 +2204,17 @@ function ensureDockerRunning(): void {
 }
 
 async function main(): Promise<void> {
-  const envPath = path.join(process.cwd(), '.env');
+  // Ensure directory structure exists before anything else
+  const { ensureDirectoryStructure } = await import('./paths.js');
+  ensureDirectoryStructure();
+
   try {
-    const envStat = fs.existsSync(envPath) ? fs.statSync(envPath) : null;
+    const envStat = fs.existsSync(ENV_PATH) ? fs.statSync(ENV_PATH) : null;
     if (!envStat || envStat.size === 0) {
-      logger.warn({ envPath }, '.env is missing or empty; set TELEGRAM_BOT_TOKEN and OpenRouter auth');
+      logger.warn({ envPath: ENV_PATH }, '.env is missing or empty; set TELEGRAM_BOT_TOKEN and OPENROUTER_API_KEY');
     }
   } catch (err) {
-    logger.warn({ envPath, err }, 'Failed to check .env file');
+    logger.warn({ envPath: ENV_PATH, err }, 'Failed to check .env file');
   }
 
   // Validate Telegram token
@@ -1826,7 +2222,7 @@ async function main(): Promise<void> {
     throw new Error(
       'TELEGRAM_BOT_TOKEN environment variable is required.\n' +
       'Create a bot with @BotFather and add the token to your .env file at: ' +
-      envPath
+      ENV_PATH
     );
   }
 
@@ -1857,35 +2253,45 @@ async function main(): Promise<void> {
   // Set up Telegram message handlers
   setupTelegramHandlers();
 
+  // Start dashboard
+  startDashboard();
+
   // Start Telegram bot
   try {
     telegrafBot.launch();
+    setTelegramConnected(true);
     logger.info('Telegram bot started');
 
     // Graceful shutdown
     process.once('SIGINT', () => {
       logger.info('Shutting down Telegram bot');
+      setTelegramConnected(false);
       telegrafBot.stop('SIGINT');
     });
     process.once('SIGTERM', () => {
       logger.info('Shutting down Telegram bot');
+      setTelegramConnected(false);
       telegrafBot.stop('SIGTERM');
     });
 
     // Start scheduler and IPC watcher
+    // Wrapper that matches the scheduler's expected interface (Promise<void>)
+    const sendMessageForScheduler = async (jid: string, text: string): Promise<void> => {
+      await sendMessage(jid, text);
+    };
     startSchedulerLoop({
-      sendMessage,
+      sendMessage: sendMessageForScheduler,
       registeredGroups: () => registeredGroups,
       getSessions: () => sessions,
       setSession: (groupFolder, sessionId) => {
         sessions[groupFolder] = sessionId;
         setGroupSession(groupFolder, sessionId);
-        saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
       }
     });
     startIpcWatcher();
     startMaintenanceLoop();
     startHeartbeatLoop();
+    startDaemonHealthCheckLoop(() => registeredGroups, MAIN_GROUP_FOLDER);
 
     logger.info('DotClaw running on Telegram (responds to DMs and group mentions/replies)');
   } catch (error) {

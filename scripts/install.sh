@@ -48,76 +48,29 @@ if [[ -z "$NODE_PATH" ]]; then
   die "node not found in PATH. Install Node 20+ and rerun."
 fi
 
-DOTCLAW_CONFIG_DIR="$TARGET_HOME/.config/dotclaw"
-PROMPTS_DIR="$DOTCLAW_CONFIG_DIR/prompts"
-TRACES_DIR="$DOTCLAW_CONFIG_DIR/traces"
+DOTCLAW_HOME="$TARGET_HOME/.dotclaw"
+CONFIG_DIR="$DOTCLAW_HOME/config"
+DATA_DIR="$DOTCLAW_HOME/data"
+GROUPS_DIR="$DOTCLAW_HOME/groups"
+PROMPTS_DIR="$DOTCLAW_HOME/prompts"
+TRACES_DIR="$DOTCLAW_HOME/traces"
+LOGS_DIR="$DOTCLAW_HOME/logs"
+ENV_FILE="$DOTCLAW_HOME/.env"
 
 log "Project root: $PROJECT_ROOT"
+log "DotClaw home: $DOTCLAW_HOME"
 log "User: $TARGET_USER"
 log "Home: $TARGET_HOME"
 log "Node: $NODE_PATH"
 
-mkdir -p "$PROMPTS_DIR" "$TRACES_DIR" "$PROJECT_ROOT/logs"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$GROUPS_DIR" "$PROMPTS_DIR" "$TRACES_DIR" "$LOGS_DIR"
 
-BEHAVIOR_CONFIG_PATH="$DOTCLAW_CONFIG_DIR/behavior.json"
-if [[ ! -f "$BEHAVIOR_CONFIG_PATH" ]]; then
-  mkdir -p "$DOTCLAW_CONFIG_DIR"
-  cat > "$BEHAVIOR_CONFIG_PATH" <<EOF
-{
-  "tool_calling_bias": 0.5,
-  "memory_importance_threshold": 0.55,
-  "response_style": "balanced",
-  "caution_bias": 0.5,
-  "last_updated": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EOF
-  chmod 600 "$BEHAVIOR_CONFIG_PATH" || true
+log "Initializing runtime directories"
+run_as_user "$NODE_PATH $PROJECT_ROOT/scripts/init.js"
+
+if [[ ! -f "$CONFIG_DIR/tool-budgets.json" ]]; then
+  cp "$PROJECT_ROOT/config-examples/tool-budgets.json" "$CONFIG_DIR/tool-budgets.json"
 fi
-
-if [[ ! -f "$PROJECT_ROOT/.env" ]]; then
-  log "Initializing .env and data directories"
-  run_as_user "$NODE_PATH $PROJECT_ROOT/scripts/init.js"
-fi
-
-update_env() {
-  local key="$1"
-  local value="$2"
-  local env_path="$PROJECT_ROOT/.env"
-  if grep -q "^${key}=" "$env_path"; then
-    sed -i "s#^${key}=.*#${key}=${value}#" "$env_path"
-  else
-    echo "${key}=${value}" >> "$env_path"
-  fi
-}
-
-update_env_default() {
-  local key="$1"
-  local value="$2"
-  local env_path="$PROJECT_ROOT/.env"
-  if grep -q "^${key}=" "$env_path"; then
-    return
-  fi
-  echo "${key}=${value}" >> "$env_path"
-}
-
-update_env_default "DOTCLAW_PROMPT_PACKS_ENABLED" "true"
-update_env_default "DOTCLAW_PROMPT_PACKS_DIR" "$PROMPTS_DIR"
-update_env_default "DOTCLAW_PROMPT_PACKS_CANARY_RATE" "0.1"
-update_env_default "DOTCLAW_TRACE_DIR" "$TRACES_DIR"
-update_env_default "DOTCLAW_CONTAINER_MODE" "daemon"
-update_env_default "CONTAINER_TIMEOUT" "900000"
-update_env_default "CONTAINER_MAX_OUTPUT_SIZE" "20971520"
-update_env_default "DOTCLAW_MAX_CONCURRENT_AGENTS" "4"
-update_env_default "DOTCLAW_WARM_START" "true"
-update_env_default "DOTCLAW_MAX_TOOL_STEPS" "32"
-update_env_default "DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES" "1500000"
-update_env_default "DOTCLAW_WEBFETCH_MAX_BYTES" "1500000"
-update_env_default "DOTCLAW_PROGRESS_ENABLED" "true"
-update_env_default "DOTCLAW_PROGRESS_INITIAL_MS" "30000"
-update_env_default "DOTCLAW_PROGRESS_INTERVAL_MS" "60000"
-update_env_default "DOTCLAW_PROGRESS_MAX_UPDATES" "3"
-update_env_default "DOTCLAW_PERSONALIZATION_CACHE_MS" "300000"
-update_env_default "DOTCLAW_BEHAVIOR_CONFIG_PATH" "$DOTCLAW_CONFIG_DIR/behavior.json"
 
 log "Installing DotClaw dependencies"
 run_as_user "cd $PROJECT_ROOT && npm install"
@@ -161,23 +114,22 @@ else
   fi
 fi
 
-AUTOTUNE_ENV="$PROJECT_ROOT/data/autotune.env"
-mkdir -p "$PROJECT_ROOT/data"
-OPENROUTER_KEY="$(grep -E '^OPENROUTER_API_KEY=' "$PROJECT_ROOT/.env" | head -n1 | cut -d= -f2- || true)"
-OPENROUTER_SITE_URL="$(grep -E '^OPENROUTER_SITE_URL=' "$PROJECT_ROOT/.env" | head -n1 | cut -d= -f2- || true)"
-OPENROUTER_SITE_NAME="$(grep -E '^OPENROUTER_SITE_NAME=' "$PROJECT_ROOT/.env" | head -n1 | cut -d= -f2- || true)"
+AUTOTUNE_ENV="$CONFIG_DIR/autotune.env"
+OPENROUTER_KEY="$(grep -E '^OPENROUTER_API_KEY=' "$ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+OPENROUTER_SITE_URL="$($NODE_PATH -e "const fs=require('fs');const p='$CONFIG_DIR/runtime.json';if(fs.existsSync(p)){const c=JSON.parse(fs.readFileSync(p,'utf8'));process.stdout.write(c?.agent?.openrouter?.siteUrl||'');}")"
+OPENROUTER_SITE_NAME="$($NODE_PATH -e "const fs=require('fs');const p='$CONFIG_DIR/runtime.json';if(fs.existsSync(p)){const c=JSON.parse(fs.readFileSync(p,'utf8'));process.stdout.write(c?.agent?.openrouter?.siteName||'');}")"
 
 if [[ -d "$AUTOTUNE_DIR" ]]; then
-  cat > "$AUTOTUNE_ENV" <<EOF
+  cat > "$AUTOTUNE_ENV" <<EOF_ENV
 OPENROUTER_API_KEY=$OPENROUTER_KEY
 OPENROUTER_SITE_URL=$OPENROUTER_SITE_URL
 OPENROUTER_SITE_NAME=${OPENROUTER_SITE_NAME:-DotClaw}
 AUTOTUNE_OUTPUT_DIR=$PROMPTS_DIR
 AUTOTUNE_TRACE_DIR=$TRACES_DIR
 AUTOTUNE_BEHAVIOR_ENABLED=1
-AUTOTUNE_BEHAVIOR_CONFIG_PATH=$DOTCLAW_CONFIG_DIR/behavior.json
-AUTOTUNE_BEHAVIOR_REPORT_DIR=$PROJECT_ROOT/data
-EOF
+AUTOTUNE_BEHAVIOR_CONFIG_PATH=$CONFIG_DIR/behavior.json
+AUTOTUNE_BEHAVIOR_REPORT_DIR=$DATA_DIR
+EOF_ENV
   chmod 600 "$AUTOTUNE_ENV" || true
   if [[ -z "$OPENROUTER_KEY" ]]; then
     warn "OPENROUTER_API_KEY missing; Autotune will not evaluate or optimize"
@@ -200,15 +152,16 @@ User=$TARGET_USER
 WorkingDirectory=$PROJECT_ROOT
 Environment=NODE_ENV=production
 Environment=HOME=$TARGET_HOME
-EnvironmentFile=$PROJECT_ROOT/.env
+Environment=DOTCLAW_HOME=$DOTCLAW_HOME
+EnvironmentFile=$ENV_FILE
 ExecStart=$NODE_PATH $PROJECT_ROOT/dist/index.js
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
 KillMode=mixed
 KillSignal=SIGINT
-StandardOutput=append:$PROJECT_ROOT/logs/dotclaw.log
-StandardError=append:$PROJECT_ROOT/logs/dotclaw.error.log
+StandardOutput=append:$LOGS_DIR/dotclaw.log
+StandardError=append:$LOGS_DIR/dotclaw.error.log
 
 [Install]
 WantedBy=multi-user.target"

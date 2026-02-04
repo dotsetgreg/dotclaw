@@ -1,4 +1,4 @@
-import { searchMemories, listEmbeddedMemories, MemorySearchResult } from './memory-store.js';
+import { searchMemories, listEmbeddedMemories, recordMemoryAccess, MemorySearchResult } from './memory-store.js';
 import {
   EMBEDDINGS_ENABLED,
   EMBEDDING_MAX_CANDIDATES,
@@ -129,6 +129,7 @@ export async function buildHybridMemoryRecall(params: {
 
   const merged = mergeResults({ fts: ftsResults, semantic: semanticResults });
   const recall: string[] = [];
+  const accessedIds: string[] = [];
   let tokens = 0;
   for (const item of merged) {
     if (recall.length >= maxResults) break;
@@ -136,7 +137,18 @@ export async function buildHybridMemoryRecall(params: {
     const estimate = estimateTokens(line);
     if (tokens + estimate > maxTokens) break;
     recall.push(line);
+    accessedIds.push(item.id);
     tokens += estimate;
   }
+
+  // Record access for recalled memories (boosts importance)
+  if (accessedIds.length > 0) {
+    try {
+      recordMemoryAccess(accessedIds);
+    } catch {
+      // Don't fail recall if access recording fails
+    }
+  }
+
   return recall;
 }

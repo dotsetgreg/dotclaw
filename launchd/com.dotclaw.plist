@@ -21,12 +21,12 @@
         <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>{{HOME}}</string>
-        <key>ASSISTANT_NAME</key>
-        <string>Rain</string>
+        <key>DOTCLAW_HOME</key>
+        <string>{{DOTCLAW_HOME}}</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>{{PROJECT_ROOT}}/logs/dotclaw.log</string>
+    <string>{{HOME}}/.dotclaw/logs/dotclaw.log</string>
     <key>StandardErrorPath</key>
-    <string>{{PROJECT_ROOT}}/logs/dotclaw.error.log</string>
+    <string>{{HOME}}/.dotclaw/logs/dotclaw.error.log</string>
 </dict>
 </plist>

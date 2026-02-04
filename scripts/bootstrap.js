@@ -1,14 +1,32 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { spawnSync } from 'child_process';
 import readline from 'readline';
+import { fileURLToPath } from 'url';
 
-const PROJECT_ROOT = process.cwd();
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Get DOTCLAW_HOME from environment or default to ~/.dotclaw
+const DOTCLAW_HOME = process.env.DOTCLAW_HOME || path.join(os.homedir(), '.dotclaw');
+const CONFIG_DIR = path.join(DOTCLAW_HOME, 'config');
+const DATA_DIR = path.join(DOTCLAW_HOME, 'data');
+const GROUPS_DIR = path.join(DOTCLAW_HOME, 'groups');
+const IPC_DIR = path.join(DATA_DIR, 'ipc');
+const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 const REGISTERED_GROUPS = path.join(DATA_DIR, 'registered_groups.json');
 
+// Package root for container build script and script paths
+const PACKAGE_ROOT = path.resolve(__dirname, '..');
+const SCRIPTS_DIR = path.join(PACKAGE_ROOT, 'scripts');
+
 function runScript(scriptName) {
-  const result = spawnSync('node', [scriptName], { stdio: 'inherit' });
+  const scriptPath = path.join(SCRIPTS_DIR, scriptName);
+  const result = spawnSync('node', [scriptPath], {
+    stdio: 'inherit',
+    env: { ...process.env, DOTCLAW_HOME }
+  });
   if (result.status !== 0) {
     process.exit(result.status || 1);
   }
@@ -54,52 +72,46 @@ function parseEnv(filePath) {
 function filterEnv(envMap) {
   const allowedVars = new Set([
     'OPENROUTER_API_KEY',
-    'OPENROUTER_MODEL',
-    'OPENROUTER_SITE_URL',
-    'OPENROUTER_SITE_NAME',
-    'BRAVE_SEARCH_API_KEY',
-    'ASSISTANT_NAME',
-    'CONTAINER_IMAGE',
-    'CONTAINER_PIDS_LIMIT',
-    'CONTAINER_MEMORY',
-    'CONTAINER_CPUS',
-    'CONTAINER_READONLY_ROOT',
-    'CONTAINER_TMPFS_SIZE',
-    'CONTAINER_RUN_UID',
-    'CONTAINER_RUN_GID'
+    'BRAVE_SEARCH_API_KEY'
   ]);
 
   const filtered = new Map();
   for (const [key, value] of envMap.entries()) {
-    if (allowedVars.has(key) || key.startsWith('DOTCLAW_')) {
+    if (allowedVars.has(key)) {
       filtered.set(key, value);
     }
   }
   return filtered;
 }
 
-function parseBool(value, defaultValue = false) {
-  if (value === undefined || value === null || value === '') return defaultValue;
-  const normalized = String(value).toLowerCase().trim();
-  return ['1', 'true', 'yes', 'on'].includes(normalized);
+function loadRuntimeConfig() {
+  const runtimePath = path.join(CONFIG_DIR, 'runtime.json');
+  if (!fs.existsSync(runtimePath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(runtimePath, 'utf-8'));
+  } catch {
+    return {};
+  }
 }
 
 function runSelfCheck({
   image,
   envVars,
-  groupFolder
+  groupFolder,
+  modelOverride,
+  containerConfig
 }) {
-  const uid = envVars.get('CONTAINER_RUN_UID') || (typeof process.getuid === 'function' ? String(process.getuid()) : '');
-  const gid = envVars.get('CONTAINER_RUN_GID') || (typeof process.getgid === 'function' ? String(process.getgid()) : '');
-  const pidsLimit = envVars.get('CONTAINER_PIDS_LIMIT') || '256';
-  const memory = envVars.get('CONTAINER_MEMORY') || '';
-  const cpus = envVars.get('CONTAINER_CPUS') || '';
-  const readOnlyRoot = parseBool(envVars.get('CONTAINER_READONLY_ROOT'), false);
-  const tmpfsSize = envVars.get('CONTAINER_TMPFS_SIZE') || '64m';
+  const uid = containerConfig.runUid || (typeof process.getuid === 'function' ? String(process.getuid()) : '');
+  const gid = containerConfig.runGid || (typeof process.getgid === 'function' ? String(process.getgid()) : '');
+  const pidsLimit = containerConfig.pidsLimit || 256;
+  const memory = containerConfig.memory || '';
+  const cpus = containerConfig.cpus || '';
+  const readOnlyRoot = !!containerConfig.readOnlyRoot;
+  const tmpfsSize = containerConfig.tmpfsSize || '64m';
 
-  const groupDir = path.join(PROJECT_ROOT, 'groups', groupFolder);
-  const sessionDir = path.join(DATA_DIR, 'sessions', groupFolder, 'openrouter');
-  const ipcDir = path.join(DATA_DIR, 'ipc', groupFolder);
+  const groupDir = path.join(GROUPS_DIR, groupFolder);
+  const sessionDir = path.join(SESSIONS_DIR, groupFolder, 'openrouter');
+  const ipcDir = path.join(IPC_DIR, groupFolder);
   const messagesDir = path.join(ipcDir, 'messages');
   const tasksDir = path.join(ipcDir, 'tasks');
   fs.mkdirSync(groupDir, { recursive: true });
@@ -129,6 +141,12 @@ function runSelfCheck({
   args.push('-v', `${groupDir}:/workspace/group`);
   args.push('-v', `${sessionDir}:/workspace/session`);
   args.push('-v', `${ipcDir}:/workspace/ipc`);
+  if (fs.existsSync(CONFIG_DIR)) {
+    args.push('-v', `${CONFIG_DIR}:/workspace/config:ro`);
+  }
+  if (fs.existsSync(DATA_DIR)) {
+    args.push('-v', `${DATA_DIR}:/workspace/data:ro`);
+  }
 
   for (const [key, value] of envVars.entries()) {
     if (!value) continue;
@@ -142,7 +160,8 @@ function runSelfCheck({
     prompt: 'self-check',
     groupFolder,
     chatJid: 'self-check',
-    isMain: true
+    isMain: true,
+    modelOverride
   });
 
   const result = spawnSync('docker', args, {
@@ -209,13 +228,13 @@ function requireEnv(name) {
 async function main() {
   console.log('DotClaw bootstrap starting...\n');
 
-  runScript('scripts/init.js');
+  runScript('init.js');
 
   const nonInteractive = parseBoolEnv(process.env.DOTCLAW_BOOTSTRAP_NONINTERACTIVE, false);
   if (nonInteractive) {
     process.env.DOTCLAW_CONFIGURE_NONINTERACTIVE = '1';
   }
-  runScript('scripts/configure.js');
+  runScript('configure.js');
 
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     console.log('Warning: You are running bootstrap as root. For best security, run as a non-root user.');
@@ -223,10 +242,10 @@ async function main() {
 
   try {
     fs.accessSync(DATA_DIR, fs.constants.W_OK);
-    fs.accessSync(path.join(PROJECT_ROOT, 'groups'), fs.constants.W_OK);
+    fs.accessSync(GROUPS_DIR, fs.constants.W_OK);
   } catch {
-    console.log('Warning: data/ or groups/ is not writable by the current user.');
-    console.log('If you encounter permission errors, run: sudo chown -R $USER data/ groups/');
+    console.log(`Warning: ${DATA_DIR} or ${GROUPS_DIR} is not writable by the current user.`);
+    console.log(`If you encounter permission errors, run: sudo chown -R $USER ${DOTCLAW_HOME}`);
   }
 
   console.log('\nNow register your main chat.');
@@ -273,23 +292,26 @@ async function main() {
     buildNow = await prompt('Build the container now? (yes/no)', 'yes');
   }
   if (buildNow.toLowerCase().startsWith('y')) {
-    const result = spawnSync('./container/build.sh', { stdio: 'inherit', shell: true });
+    const buildScript = path.join(PACKAGE_ROOT, 'container', 'build.sh');
+    const result = spawnSync(buildScript, { stdio: 'inherit', shell: true });
     if (result.status !== 0) {
-      console.log('Container build failed. You can retry with: ./container/build.sh');
+      console.log(`Container build failed. You can retry with: ${buildScript}`);
     }
   } else {
     console.log('Skipped container build.');
   }
 
-  const envMap = parseEnv(path.join(PROJECT_ROOT, '.env'));
+  const envMap = parseEnv(path.join(DOTCLAW_HOME, '.env'));
   const filteredEnv = filterEnv(envMap);
-  if (!filteredEnv.get('OPENROUTER_MODEL')) {
-    const modelConfig = loadJson(path.join(DATA_DIR, 'model.json'), {});
-    if (modelConfig && typeof modelConfig.model === 'string') {
-      filteredEnv.set('OPENROUTER_MODEL', modelConfig.model);
-    }
-  }
-  const image = filteredEnv.get('CONTAINER_IMAGE') || 'dotclaw-agent:latest';
+  const runtimeConfig = loadRuntimeConfig();
+  const containerConfig = runtimeConfig?.host?.container || {};
+  const image = containerConfig.image || 'dotclaw-agent:latest';
+
+  const modelConfig = loadJson(path.join(CONFIG_DIR, 'model.json'), {});
+  const modelOverride = typeof modelConfig.model === 'string' && modelConfig.model.trim()
+    ? modelConfig.model.trim()
+    : 'moonshotai/kimi-k2.5';
+
   if (!filteredEnv.get('OPENROUTER_API_KEY')) {
     console.log('Self-check skipped: OPENROUTER_API_KEY is not set in .env.');
   } else {
@@ -303,7 +325,9 @@ async function main() {
       const ok = runSelfCheck({
         image,
         envVars: filteredEnv,
-        groupFolder: folder
+        groupFolder: folder,
+        modelOverride,
+        containerConfig
       });
       if (!ok) {
         console.log('Self-check failed. Fix issues before starting the app.');
@@ -315,7 +339,7 @@ async function main() {
   }
 
   console.log('\nNext: start the app.');
-  console.log('  npm run build && npm start');
+  console.log('  dotclaw start');
 }
 
 main().catch(err => {

@@ -1,10 +1,28 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
 
-const PROJECT_ROOT = process.cwd();
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const GROUPS_DIR = path.join(PROJECT_ROOT, 'groups');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Get DOTCLAW_HOME from environment or default to ~/.dotclaw
+const DOTCLAW_HOME = process.env.DOTCLAW_HOME || path.join(os.homedir(), '.dotclaw');
+const CONFIG_DIR = path.join(DOTCLAW_HOME, 'config');
+const DATA_DIR = path.join(DOTCLAW_HOME, 'data');
+const STORE_DIR = path.join(DATA_DIR, 'store');
+const GROUPS_DIR = path.join(DOTCLAW_HOME, 'groups');
+const LOGS_DIR = path.join(DOTCLAW_HOME, 'logs');
+const TRACES_DIR = path.join(DOTCLAW_HOME, 'traces');
+const PROMPTS_DIR = path.join(DOTCLAW_HOME, 'prompts');
+const ENV_PATH = path.join(DOTCLAW_HOME, '.env');
+const MOUNT_ALLOWLIST_DIR = path.join(os.homedir(), '.config', 'dotclaw');
+const MOUNT_ALLOWLIST_PATH = path.join(MOUNT_ALLOWLIST_DIR, 'mount-allowlist.json');
+
+// Package root for copying example configs
+const PACKAGE_ROOT = path.resolve(__dirname, '..');
+const CONFIG_EXAMPLES_DIR = path.join(PACKAGE_ROOT, 'config-examples');
 
 function log(message) {
   console.log(message);
@@ -16,6 +34,7 @@ function ensureDir(dir) {
 
 function ensureFile(filePath, contents) {
   if (!fs.existsSync(filePath)) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, contents);
     return true;
   }
@@ -33,34 +52,67 @@ function checkDocker() {
 }
 
 function initFiles() {
+  // Create directory structure
+  ensureDir(DOTCLAW_HOME);
+  ensureDir(CONFIG_DIR);
   ensureDir(DATA_DIR);
+  ensureDir(STORE_DIR);
   ensureDir(GROUPS_DIR);
   ensureDir(path.join(GROUPS_DIR, 'main'));
   ensureDir(path.join(GROUPS_DIR, 'global'));
+  ensureDir(LOGS_DIR);
+  ensureDir(TRACES_DIR);
+  ensureDir(PROMPTS_DIR);
+  ensureDir(MOUNT_ALLOWLIST_DIR);
 
+  // Set restrictive permissions
   try {
+    fs.chmodSync(DOTCLAW_HOME, 0o700);
+    fs.chmodSync(CONFIG_DIR, 0o700);
     fs.chmodSync(DATA_DIR, 0o700);
-    fs.chmodSync(GROUPS_DIR, 0o700);
   } catch {
     // Best-effort; permissions may be controlled by the OS or user policy.
   }
 
+  // Config files
   const registeredGroupsPath = path.join(DATA_DIR, 'registered_groups.json');
-  const sessionsPath = path.join(DATA_DIR, 'sessions.json');
-  const modelConfigPath = path.join(DATA_DIR, 'model.json');
-  const homeDir = process.env.HOME || PROJECT_ROOT;
-  const dotclawConfigDir = path.join(homeDir, '.config', 'dotclaw');
-  const behaviorConfigPath = path.join(dotclawConfigDir, 'behavior.json');
-  const toolPolicyPath = path.join(DATA_DIR, 'tool-policy.json');
+  const modelConfigPath = path.join(CONFIG_DIR, 'model.json');
+  const behaviorConfigPath = path.join(CONFIG_DIR, 'behavior.json');
+  const toolPolicyPath = path.join(CONFIG_DIR, 'tool-policy.json');
+  const toolBudgetsPath = path.join(CONFIG_DIR, 'tool-budgets.json');
+  const runtimeConfigPath = path.join(CONFIG_DIR, 'runtime.json');
+
+  // Seed CLAUDE.md templates if missing
+  const mainClaudePath = path.join(GROUPS_DIR, 'main', 'CLAUDE.md');
+  const globalClaudePath = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+  const mainClaudeExample = path.join(CONFIG_EXAMPLES_DIR, 'groups', 'main', 'CLAUDE.md');
+  const globalClaudeExample = path.join(CONFIG_EXAMPLES_DIR, 'groups', 'global', 'CLAUDE.md');
+  if (!fs.existsSync(mainClaudePath) && fs.existsSync(mainClaudeExample)) {
+    fs.copyFileSync(mainClaudeExample, mainClaudePath);
+  }
+  if (!fs.existsSync(globalClaudePath) && fs.existsSync(globalClaudeExample)) {
+    fs.copyFileSync(globalClaudeExample, globalClaudePath);
+  }
 
   const createdRegistered = ensureFile(registeredGroupsPath, '{}\n');
-  const createdSessions = ensureFile(sessionsPath, '{}\n');
   const createdModelConfig = ensureFile(modelConfigPath, JSON.stringify({
     model: 'moonshotai/kimi-k2.5',
-    allowlist: [],
+    allowlist: [
+      'moonshotai/kimi-k2.5',
+      'openai/gpt-5-mini',
+      'openai/gpt-5-nano'
+    ],
+    overrides: {
+      'moonshotai/kimi-k2.5': {
+        context_window: 32000,
+        max_output_tokens: 2048,
+        tokens_per_char: 0.6,
+        tokens_per_message: 4,
+        tokens_per_request: 50
+      }
+    },
     updated_at: new Date().toISOString()
   }, null, 2) + '\n');
-  fs.mkdirSync(dotclawConfigDir, { recursive: true });
   const createdBehaviorConfig = ensureFile(behaviorConfigPath, JSON.stringify({
     tool_calling_bias: 0.5,
     memory_importance_threshold: 0.55,
@@ -68,140 +120,88 @@ function initFiles() {
     caution_bias: 0.5,
     last_updated: new Date().toISOString()
   }, null, 2) + '\n');
-  const createdToolPolicy = ensureFile(toolPolicyPath, JSON.stringify({
-    default: {
-      allow: [
-        'Read',
-        'Write',
-        'Edit',
-        'Glob',
-        'Grep',
-        'GitClone',
-        'NpmInstall',
-        'WebSearch',
-        'WebFetch',
-        'Bash',
-        'mcp__dotclaw__send_message',
-        'mcp__dotclaw__schedule_task',
-        'mcp__dotclaw__list_tasks',
-        'mcp__dotclaw__pause_task',
-        'mcp__dotclaw__resume_task',
-        'mcp__dotclaw__cancel_task',
-        'mcp__dotclaw__update_task',
-        'mcp__dotclaw__register_group',
-        'mcp__dotclaw__remove_group',
-        'mcp__dotclaw__list_groups',
-        'mcp__dotclaw__set_model',
-        'mcp__dotclaw__memory_upsert',
-        'mcp__dotclaw__memory_forget',
-        'mcp__dotclaw__memory_list',
-        'mcp__dotclaw__memory_search',
-        'mcp__dotclaw__memory_stats'
-      ],
-      deny: [],
-      max_per_run: {
-        Bash: 4,
-        WebSearch: 5,
-        WebFetch: 6
-      },
-      default_max_per_run: 32
-    }
-  }, null, 2) + '\n');
+  const toolPolicyExamplePath = path.join(CONFIG_EXAMPLES_DIR, 'tool-policy.json');
+  const toolPolicyPayload = fs.existsSync(toolPolicyExamplePath)
+    ? fs.readFileSync(toolPolicyExamplePath, 'utf-8')
+    : JSON.stringify({ default: {} }, null, 2);
+  const createdToolPolicy = ensureFile(
+    toolPolicyPath,
+    toolPolicyPayload.endsWith('\n') ? toolPolicyPayload : toolPolicyPayload + '\n'
+  );
 
-  const envPath = path.join(PROJECT_ROOT, '.env');
+  const toolBudgetsExamplePath = path.join(CONFIG_EXAMPLES_DIR, 'tool-budgets.json');
+  const toolBudgetsPayload = fs.existsSync(toolBudgetsExamplePath)
+    ? fs.readFileSync(toolBudgetsExamplePath, 'utf-8')
+    : JSON.stringify({ default: { per_day: {} } }, null, 2);
+  const createdToolBudgets = ensureFile(
+    toolBudgetsPath,
+    toolBudgetsPayload.endsWith('\n') ? toolBudgetsPayload : toolBudgetsPayload + '\n'
+  );
+
+  // Copy runtime config from examples if available
+  const runtimeExamplePath = path.join(CONFIG_EXAMPLES_DIR, 'runtime.json');
+  const runtimePayload = fs.existsSync(runtimeExamplePath)
+    ? fs.readFileSync(runtimeExamplePath, 'utf-8')
+    : '{\n  "host": {},\n  "agent": {}\n}\n';
+  const createdRuntimeConfig = ensureFile(
+    runtimeConfigPath,
+    runtimePayload.endsWith('\n') ? runtimePayload : runtimePayload + '\n'
+  );
+
+  // Mount allowlist template (kept outside DotClaw home)
+  const allowlistTemplate = JSON.stringify({
+    allowedRoots: [],
+    blockedPatterns: [],
+    nonMainReadOnly: true
+  }, null, 2) + '\n';
+  const createdAllowlist = ensureFile(MOUNT_ALLOWLIST_PATH, allowlistTemplate);
+  if (createdAllowlist) {
+    try {
+      fs.chmodSync(MOUNT_ALLOWLIST_PATH, 0o600);
+    } catch {
+      // best-effort
+    }
+  }
+
+  // Environment file
   const envSample = [
-    '# Telegram bot token from @BotFather',
+    '# DotClaw Secrets',
+    '# These values are required for DotClaw to function.',
+    '',
     'TELEGRAM_BOT_TOKEN=your_bot_token_here',
-    '',
-    '# OpenRouter authentication',
     'OPENROUTER_API_KEY=your_openrouter_api_key',
-    'OPENROUTER_MODEL=moonshotai/kimi-k2.5',
-    '# Optional attribution headers (recommended by OpenRouter)',
-    'OPENROUTER_SITE_URL=https://your-domain.example',
-    'OPENROUTER_SITE_NAME=DotClaw',
     '',
-    '# Brave Search API (for WebSearch tool)',
-    'BRAVE_SEARCH_API_KEY=your_brave_search_api_key',
-    '',
-    '# Optional memory tuning (defaults are solid)',
-    'DOTCLAW_MAX_CONTEXT_TOKENS=200000',
-    'DOTCLAW_RECENT_CONTEXT_TOKENS=80000',
-    'DOTCLAW_MAX_OUTPUT_TOKENS=4096',
-    'DOTCLAW_SUMMARY_UPDATE_EVERY_MESSAGES=12',
-    'DOTCLAW_SUMMARY_MAX_OUTPUT_TOKENS=1200',
-    'DOTCLAW_SUMMARY_MODEL=moonshotai/kimi-k2.5',
-    '',
-    '# Long-term memory v2',
-    'DOTCLAW_MEMORY_RECALL_MAX_RESULTS=8',
-    'DOTCLAW_MEMORY_RECALL_MAX_TOKENS=1200',
-    'DOTCLAW_MEMORY_EXTRACTION_ENABLED=true',
-    'DOTCLAW_MEMORY_EXTRACTION_MESSAGES=8',
-    'DOTCLAW_MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS=900',
-    'DOTCLAW_MEMORY_MODEL=moonshotai/kimi-k2.5',
-    'DOTCLAW_MEMORY_EMBEDDINGS_ENABLED=true',
-    'DOTCLAW_MEMORY_EMBEDDING_MODEL=openai/text-embedding-3-small',
-    'DOTCLAW_MEMORY_EMBEDDING_BATCH_SIZE=8',
-    'DOTCLAW_MEMORY_EMBEDDING_INTERVAL_MS=300000',
-    '',
-    '# Prompt packs (Autotune output)',
-    'DOTCLAW_PROMPT_PACKS_ENABLED=true',
-    'DOTCLAW_PROMPT_PACKS_DIR=~/.config/dotclaw/prompts',
-    'DOTCLAW_PROMPT_PACKS_CANARY_RATE=0.1',
-    '',
-    '# Tracing (Autotune input)',
-    'DOTCLAW_TRACE_DIR=~/.config/dotclaw/traces',
-    'DOTCLAW_TRACE_SAMPLE_RATE=1',
-    '',
-    '# Tool budgets (optional)',
-    'DOTCLAW_TOOL_BUDGETS_ENABLED=false',
-    'DOTCLAW_TOOL_BUDGETS_PATH=./data/tool-budgets.json',
-    '',
-    '# Performance + observability',
-    'DOTCLAW_CONTAINER_MODE=daemon',
-    'DOTCLAW_CONTAINER_DAEMON_POLL_MS=200',
-    'CONTAINER_TIMEOUT=900000',
-    'CONTAINER_MAX_OUTPUT_SIZE=20971520',
-    'DOTCLAW_MAX_CONCURRENT_AGENTS=4',
-    'DOTCLAW_WARM_START=true',
-    'DOTCLAW_MAX_TOOL_STEPS=32',
-    'DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES=1500000',
-    'DOTCLAW_WEBFETCH_MAX_BYTES=1500000',
-    'DOTCLAW_METRICS_PORT=3001',
-    'DOTCLAW_PROGRESS_ENABLED=true',
-    'DOTCLAW_PROGRESS_INITIAL_MS=30000',
-    'DOTCLAW_PROGRESS_INTERVAL_MS=60000',
-    'DOTCLAW_PROGRESS_MAX_UPDATES=3',
-    'DOTCLAW_PROGRESS_MESSAGES="Working on it.|Still working.|Almost there."',
-    '',
-    '# Personalization',
-    `DOTCLAW_BEHAVIOR_CONFIG_PATH=${behaviorConfigPath}`,
-    'DOTCLAW_PERSONALIZATION_CACHE_MS=300000',
-    ''
+    '# Optional: Brave Search for web search capability',
+    'BRAVE_SEARCH_API_KEY=your_brave_search_api_key'
   ].join('\n');
 
-  const createdEnv = ensureFile(envPath, envSample);
+  const createdEnv = ensureFile(ENV_PATH, envSample);
   if (createdEnv) {
     try {
-      fs.chmodSync(envPath, 0o600);
+      fs.chmodSync(ENV_PATH, 0o600);
     } catch {
       // Best-effort; permissions may be controlled by the OS or user policy.
     }
   }
 
+  log(`DOTCLAW_HOME: ${DOTCLAW_HOME}`);
   log(`registered_groups.json: ${createdRegistered ? 'created' : 'exists'}`);
-  log(`sessions.json: ${createdSessions ? 'created' : 'exists'}`);
   log(`model.json: ${createdModelConfig ? 'created' : 'exists'}`);
-  log(`behavior.json: ${createdBehaviorConfig ? 'created' : 'exists'} (${behaviorConfigPath})`);
+  log(`behavior.json: ${createdBehaviorConfig ? 'created' : 'exists'}`);
   log(`tool-policy.json: ${createdToolPolicy ? 'created' : 'exists'}`);
+  log(`tool-budgets.json: ${createdToolBudgets ? 'created' : 'exists'}`);
+  log(`runtime.json: ${createdRuntimeConfig ? 'created' : 'exists'}`);
   log(`.env: ${createdEnv ? 'created (edit this file)' : 'exists'}`);
+  log(`mount-allowlist.json: ${createdAllowlist ? 'created (edit to enable mounts)' : 'exists'}`);
 }
 
 function printNextSteps() {
   log('\nNext steps:');
-  log('1) Edit .env with your Telegram bot token and OpenRouter auth');
-  log('2) Build the container: ./container/build.sh');
-  log('3) Register your chat in data/registered_groups.json');
-  log('4) npm run build && npm start');
+  log(`1) Edit ${ENV_PATH} with your Telegram bot token and OpenRouter API key`);
+  log(`2) (Optional) Edit ${path.join(CONFIG_DIR, 'runtime.json')} for tuning`);
+  log('3) Build the container: dotclaw build');
+  log('4) Register your chat: dotclaw register');
+  log('5) Start the service: dotclaw start');
 }
 
 checkDocker();

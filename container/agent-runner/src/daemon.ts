@@ -1,11 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import { runAgentOnce } from './index.js';
-import type { ContainerInput } from './index.js';
+import { loadAgentConfig } from './agent-config.js';
+import type { ContainerInput } from './container-protocol.js';
 
 const REQUESTS_DIR = '/workspace/ipc/agent_requests';
 const RESPONSES_DIR = '/workspace/ipc/agent_responses';
-const POLL_MS = parseInt(process.env.DOTCLAW_DAEMON_POLL_MS || '200', 10);
+const HEARTBEAT_FILE = '/workspace/ipc/heartbeat';
+const POLL_MS = loadAgentConfig().daemonPollMs;
 
 function log(message: string): void {
   console.error(`[agent-daemon] ${message}`);
@@ -14,6 +16,14 @@ function log(message: string): void {
 function ensureDirs(): void {
   fs.mkdirSync(REQUESTS_DIR, { recursive: true });
   fs.mkdirSync(RESPONSES_DIR, { recursive: true });
+}
+
+function writeHeartbeat(): void {
+  try {
+    fs.writeFileSync(HEARTBEAT_FILE, Date.now().toString());
+  } catch {
+    // Ignore heartbeat write errors
+  }
 }
 
 async function processRequests(): Promise<void> {
@@ -63,6 +73,9 @@ async function loop(): Promise<void> {
   ensureDirs();
   log('Daemon started');
   while (true) {
+    // Write heartbeat at the start of each loop iteration
+    writeHeartbeat();
+
     try {
       await processRequests();
     } catch (err) {

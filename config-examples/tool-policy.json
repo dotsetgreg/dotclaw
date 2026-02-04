@@ -11,6 +11,7 @@
       "WebSearch",
       "WebFetch",
       "Bash",
+      "Python",
       "mcp__dotclaw__send_message",
       "mcp__dotclaw__schedule_task",
       "mcp__dotclaw__list_tasks",
@@ -31,6 +32,7 @@
     "deny": [],
     "max_per_run": {
       "Bash": 4,
+      "Python": 4,
       "WebSearch": 5,
       "WebFetch": 6
     },

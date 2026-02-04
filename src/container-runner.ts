@@ -6,7 +6,6 @@
 import { spawn, execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import pino from 'pino';
 import {
   CONTAINER_IMAGE,
   CONTAINER_TIMEOUT,
@@ -21,88 +20,24 @@ import {
   CONTAINER_MODE,
   CONTAINER_DAEMON_POLL_MS,
   GROUPS_DIR,
+  CONFIG_DIR,
   DATA_DIR,
-  MODEL_CONFIG_PATH,
+  ENV_PATH,
   PROMPT_PACKS_DIR
 } from './config.js';
+import { PACKAGE_ROOT } from './paths.js';
 import { RegisteredGroup } from './types.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { loadModelConfig } from './utils.js';
+import { loadRuntimeConfig } from './runtime-config.js';
+import { OUTPUT_START_MARKER, OUTPUT_END_MARKER } from './container-protocol.js';
+import type { ContainerInput, ContainerOutput } from './container-protocol.js';
+import { logger } from './logger.js';
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport: { target: 'pino-pretty', options: { colorize: true } }
-});
+const runtime = loadRuntimeConfig();
 
 // Sentinel markers for robust output parsing (must match agent-runner)
-const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
 const CONTAINER_ID_DIR = path.join(DATA_DIR, 'tmp');
 
-
-export interface ContainerInput {
-  prompt: string;
-  sessionId?: string;
-  groupFolder: string;
-  chatJid: string;
-  isMain: boolean;
-  isScheduledTask?: boolean;
-  taskId?: string;
-  userId?: string;
-  userName?: string;
-  memoryRecall?: string[];
-  userProfile?: string | null;
-  memoryStats?: {
-    total: number;
-    user: number;
-    group: number;
-    global: number;
-  };
-  tokenEstimate?: {
-    tokens_per_char: number;
-    tokens_per_message: number;
-    tokens_per_request: number;
-  };
-  toolReliability?: Array<{
-    name: string;
-    success_rate: number;
-    count: number;
-    avg_duration_ms: number | null;
-  }>;
-  behaviorConfig?: Record<string, unknown>;
-  toolPolicy?: Record<string, unknown>;
-  modelOverride?: string;
-  modelContextTokens?: number;
-  modelMaxOutputTokens?: number;
-  modelTemperature?: number;
-}
-
-export interface ContainerOutput {
-  status: 'success' | 'error';
-  result: string | null;
-  newSessionId?: string;
-  error?: string;
-  model?: string;
-  prompt_pack_versions?: Record<string, string>;
-  memory_summary?: string;
-  memory_facts?: string[];
-  tokens_prompt?: number;
-  tokens_completion?: number;
-  memory_recall_count?: number;
-  session_recall_count?: number;
-  memory_items_upserted?: number;
-  memory_items_extracted?: number;
-  tool_calls?: Array<{
-    name: string;
-    args?: unknown;
-    ok: boolean;
-    duration_ms?: number;
-    error?: string;
-    output_bytes?: number;
-    output_truncated?: boolean;
-  }>;
-  latency_ms?: number;
-}
 
 interface VolumeMount {
   hostPath: string;
@@ -112,21 +47,21 @@ interface VolumeMount {
 
 function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount[] {
   const mounts: VolumeMount[] = [];
-  const projectRoot = process.cwd();
+  const envFile = ENV_PATH;
 
   if (isMain) {
-    // Main gets the entire project root mounted
+    // Main gets the package root mounted (read-only for safety)
     mounts.push({
-      hostPath: projectRoot,
+      hostPath: PACKAGE_ROOT,
       containerPath: '/workspace/project',
-      readonly: false
+      readonly: true
     });
 
-    // Mask .env inside the project root to avoid leaking secrets to the container
-    const envMaskDir = path.join(DATA_DIR, 'env');
-    const envMaskFile = path.join(envMaskDir, '.env-mask');
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
+    // Mask .env inside the package root to avoid leaking secrets to the container
+    const packageEnvFile = path.join(PACKAGE_ROOT, '.env');
+    if (fs.existsSync(packageEnvFile)) {
+      const envMaskDir = path.join(DATA_DIR, 'env');
+      const envMaskFile = path.join(envMaskDir, '.env-mask');
       fs.mkdirSync(envMaskDir, { recursive: true });
       if (!fs.existsSync(envMaskFile)) {
         fs.writeFileSync(envMaskFile, '');
@@ -218,7 +153,7 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     fs.chmodSync(agentResponsesDir, 0o770);
   } catch {
     // Permissions may already be correct, or user needs to fix ownership manually
-    logger.warn({ path: groupIpcDir }, 'Could not chmod IPC directories - run: sudo chown -R $USER data/');
+    logger.warn({ path: groupIpcDir, dataDir: DATA_DIR }, 'Could not chmod IPC directories - run: sudo chown -R $USER ~/.dotclaw/data/ipc');
   }
   mounts.push({
     hostPath: groupIpcDir,
@@ -235,8 +170,21 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     });
   }
 
+  // Config directory (read-only) - contains runtime.json and other config files
+  if (fs.existsSync(CONFIG_DIR)) {
+    mounts.push({
+      hostPath: CONFIG_DIR,
+      containerPath: '/workspace/config',
+      readonly: true
+    });
+  }
+
+  // Data directory (read-only) - contains databases, sessions, etc.
+  // Note: do NOT mount the full data directory into containers.
+  // This prevents cross-group leakage of sessions, IPC, and databases.
+
   // Environment file directory (keeps credentials out of process listings)
-  // Only expose specific auth/config variables needed by the agent, not the entire .env
+  // Inject only secrets from .env
   const envDir = path.join(DATA_DIR, 'env');
   fs.mkdirSync(envDir, { recursive: true });
   try {
@@ -244,58 +192,60 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   } catch {
     logger.warn({ path: envDir }, 'Could not chmod env directory');
   }
-  const envFile = path.join(projectRoot, '.env');
+
+  const envVars = new Map<string, string>();
+  const setEnvVar = (key: string, value: string, source: string) => {
+    if (!/^[A-Z0-9_]+$/.test(key)) {
+      logger.warn({ key, source }, 'Skipping invalid env var name for container');
+      return;
+    }
+    if (value.includes('\n')) {
+      logger.warn({ key, source }, 'Skipping env var with newline for container');
+      return;
+    }
+    envVars.set(key, value);
+  };
+
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = [
+    const secretVars = new Set([
       'OPENROUTER_API_KEY',
-      'OPENROUTER_MODEL',
-      'OPENROUTER_SITE_URL',
-      'OPENROUTER_SITE_NAME',
-      'BRAVE_SEARCH_API_KEY',
-      'ASSISTANT_NAME'
-    ];
-    const allowedPrefixes = ['DOTCLAW_'];
-    const filteredLines = envContent
-      .split('\n')
-      .filter(line => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) return false;
-        if (allowedVars.some(v => trimmed.startsWith(`${v}=`))) return true;
-        return allowedPrefixes.some(prefix => trimmed.startsWith(prefix));
-      });
-
-    const envLines = new Map<string, string>();
-    for (const line of filteredLines) {
-      const idx = line.indexOf('=');
+      'BRAVE_SEARCH_API_KEY'
+    ]);
+    for (const line of envContent.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
       if (idx === -1) continue;
-      const key = line.slice(0, idx).trim();
-      envLines.set(key, line);
+      const key = trimmed.slice(0, idx).trim();
+      if (!secretVars.has(key)) continue;
+      const value = trimmed.slice(idx + 1);
+      setEnvVar(key, value, 'dotenv');
     }
+  }
 
-    const modelConfig = loadModelConfig(
-      MODEL_CONFIG_PATH,
-      process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5'
-    );
-    if (modelConfig.model) {
-      envLines.set('OPENROUTER_MODEL', `OPENROUTER_MODEL=${modelConfig.model}`);
+  if (group.containerConfig?.env) {
+    for (const [key, value] of Object.entries(group.containerConfig.env)) {
+      if (typeof value !== 'string') continue;
+      setEnvVar(key, value, 'containerConfig');
     }
+  }
 
-    if (envLines.size > 0) {
-      const mergedLines = Array.from(envLines.values());
-      const envOutPath = path.join(envDir, 'env');
-      fs.writeFileSync(envOutPath, mergedLines.join('\n') + '\n');
-      try {
-        fs.chmodSync(envOutPath, 0o600);
-      } catch {
-        logger.warn({ path: envOutPath }, 'Could not chmod env file');
-      }
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true
-      });
+
+  if (envVars.size > 0) {
+    const mergedLines = Array.from(envVars.entries()).map(([key, value]) => `${key}=${value}`);
+    const envOutPath = path.join(envDir, 'env');
+    fs.writeFileSync(envOutPath, mergedLines.join('\n') + '\n');
+    try {
+      fs.chmodSync(envOutPath, 0o600);
+    } catch {
+      logger.warn({ path: envOutPath }, 'Could not chmod env file');
     }
+    mounts.push({
+      hostPath: envDir,
+      containerPath: '/workspace/env-dir',
+      readonly: true
+    });
   }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
@@ -373,7 +323,6 @@ function buildDaemonArgs(mounts: VolumeMount[], containerName: string, groupFold
   }
   args.push('--env', 'HOME=/tmp');
   args.push('--env', 'DOTCLAW_DAEMON=1');
-  args.push('--env', `DOTCLAW_DAEMON_POLL_MS=${CONTAINER_DAEMON_POLL_MS}`);
 
   if (CONTAINER_MEMORY) {
     args.push(`--memory=${CONTAINER_MEMORY}`);
@@ -417,6 +366,128 @@ function isContainerRunning(name: string): boolean {
   }
 }
 
+const DAEMON_HEALTH_CHECK_INTERVAL_MS = 60_000; // Check every 60 seconds
+const DAEMON_HEARTBEAT_MAX_AGE_MS = 30_000; // Consider unhealthy if heartbeat older than 30s
+
+/**
+ * Check if a daemon container is healthy by reading its heartbeat file
+ */
+export function checkDaemonHealth(groupFolder: string): { healthy: boolean; lastHeartbeat?: number; ageMs?: number } {
+  const heartbeatPath = path.join(DATA_DIR, 'ipc', groupFolder, 'heartbeat');
+  try {
+    if (!fs.existsSync(heartbeatPath)) {
+      return { healthy: false };
+    }
+    const content = fs.readFileSync(heartbeatPath, 'utf-8').trim();
+    const lastHeartbeat = parseInt(content, 10);
+    if (!Number.isFinite(lastHeartbeat)) {
+      return { healthy: false };
+    }
+    const ageMs = Date.now() - lastHeartbeat;
+    return {
+      healthy: ageMs < DAEMON_HEARTBEAT_MAX_AGE_MS,
+      lastHeartbeat,
+      ageMs
+    };
+  } catch {
+    return { healthy: false };
+  }
+}
+
+/**
+ * Restart a daemon container if unhealthy
+ */
+export function restartDaemonContainer(group: RegisteredGroup, isMain: boolean): void {
+  const containerName = getDaemonContainerName(group.folder);
+
+  // Stop existing container
+  try {
+    execSync(`docker rm -f ${containerName}`, { stdio: 'ignore' });
+  } catch {
+    // Ignore if container doesn't exist
+  }
+
+  // Start new container
+  const mounts = buildVolumeMounts(group, isMain);
+  ensureDaemonContainer(mounts, group.folder);
+  logger.info({ groupFolder: group.folder }, 'Daemon container restarted');
+}
+
+// Track daemon health check state
+let healthCheckInterval: NodeJS.Timeout | null = null;
+const unhealthyDaemons = new Map<string, number>(); // Track consecutive unhealthy checks
+
+/**
+ * Perform health check on all daemon containers and restart if needed
+ */
+export function performDaemonHealthChecks(
+  getRegisteredGroups: () => Record<string, RegisteredGroup>,
+  mainGroupFolder: string
+): void {
+  if (CONTAINER_MODE !== 'daemon') return;
+
+  const groups = getRegisteredGroups();
+
+  for (const [, group] of Object.entries(groups)) {
+    const containerName = getDaemonContainerName(group.folder);
+
+    // Skip if container isn't running (may be intentionally stopped)
+    if (!isContainerRunning(containerName)) {
+      unhealthyDaemons.delete(group.folder);
+      continue;
+    }
+
+    const health = checkDaemonHealth(group.folder);
+
+    if (health.healthy) {
+      unhealthyDaemons.delete(group.folder);
+    } else {
+      const consecutiveFailures = (unhealthyDaemons.get(group.folder) || 0) + 1;
+      unhealthyDaemons.set(group.folder, consecutiveFailures);
+
+      logger.warn({
+        groupFolder: group.folder,
+        consecutiveFailures,
+        ageMs: health.ageMs
+      }, 'Daemon container unhealthy');
+
+      // Restart after 2 consecutive failures
+      if (consecutiveFailures >= 2) {
+        logger.info({ groupFolder: group.folder }, 'Restarting unhealthy daemon');
+        restartDaemonContainer(group, group.folder === mainGroupFolder);
+        unhealthyDaemons.delete(group.folder);
+      }
+    }
+  }
+}
+
+/**
+ * Start the daemon health check loop
+ */
+export function startDaemonHealthCheckLoop(
+  getRegisteredGroups: () => Record<string, RegisteredGroup>,
+  mainGroupFolder: string
+): void {
+  if (CONTAINER_MODE !== 'daemon') return;
+  if (healthCheckInterval) return;
+
+  healthCheckInterval = setInterval(() => {
+    performDaemonHealthChecks(getRegisteredGroups, mainGroupFolder);
+  }, DAEMON_HEALTH_CHECK_INTERVAL_MS);
+
+  logger.info('Daemon health check loop started');
+}
+
+/**
+ * Stop the daemon health check loop
+ */
+export function stopDaemonHealthCheckLoop(): void {
+  if (healthCheckInterval) {
+    clearInterval(healthCheckInterval);
+    healthCheckInterval = null;
+  }
+}
+
 function ensureDaemonContainer(mounts: VolumeMount[], groupFolder: string): void {
   const containerName = getDaemonContainerName(groupFolder);
   if (isContainerRunning(containerName)) return;
@@ -455,9 +526,16 @@ function writeAgentRequest(groupFolder: string, payload: object): { id: string; 
   return { id, requestPath, responsePath };
 }
 
-async function waitForAgentResponse(responsePath: string, timeoutMs: number): Promise<ContainerOutput> {
+async function waitForAgentResponse(
+  responsePath: string,
+  timeoutMs: number,
+  abortSignal?: AbortSignal
+): Promise<ContainerOutput> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    if (abortSignal?.aborted) {
+      throw new Error('Agent run preempted');
+    }
     if (fs.existsSync(responsePath)) {
       const raw = fs.readFileSync(responsePath, 'utf-8');
       fs.unlinkSync(responsePath);
@@ -489,10 +567,11 @@ function removeContainerById(containerId: string, reason: string): void {
 
 export async function runContainerAgent(
   group: RegisteredGroup,
-  input: ContainerInput
+  input: ContainerInput,
+  options?: { abortSignal?: AbortSignal }
 ): Promise<ContainerOutput> {
   if (CONTAINER_MODE === 'daemon') {
-    return runContainerAgentDaemon(group, input);
+    return runContainerAgentDaemon(group, input, options);
   }
 
   const startTime = Date.now();
@@ -534,6 +613,7 @@ export async function runContainerAgent(
     let stderr = '';
     let stdoutTruncated = false;
     let stderrTruncated = false;
+    let resolved = false;
 
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
@@ -588,6 +668,8 @@ export async function runContainerAgent(
       logger.error({ group: group.name }, 'Container timeout, killing');
       stopContainer('timeout');
       container.kill('SIGKILL');
+      if (resolved) return;
+      resolved = true;
       resolve({
         status: 'error',
         result: null,
@@ -595,14 +677,43 @@ export async function runContainerAgent(
       });
     }, timeoutMs);
 
-    container.on('close', (code) => {
+    const abortSignal = options?.abortSignal;
+    const abortHandler = () => {
+      if (resolved) return;
+      resolved = true;
+      logger.warn({ group: group.name }, 'Container run preempted');
+      stopContainer('preempted');
+      container.kill('SIGKILL');
       clearTimeout(timeout);
+      cleanupCid();
+      resolve({
+        status: 'error',
+        result: null,
+        error: 'Container run preempted'
+      });
+    };
+
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        abortHandler();
+      } else {
+        abortSignal.addEventListener('abort', abortHandler, { once: true });
+      }
+    }
+
+    container.on('close', (code) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      if (abortSignal) {
+        abortSignal.removeEventListener('abort', abortHandler);
+      }
       cleanupCid();
       const duration = Date.now() - startTime;
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const logFile = path.join(logsDir, `container-${timestamp}.log`);
-      const isVerbose = process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
+      const isVerbose = runtime.host.logLevel === 'debug' || runtime.host.logLevel === 'trace';
 
       const logLines = [
         `=== Container Run Log ===`,
@@ -713,7 +824,12 @@ export async function runContainerAgent(
     });
 
     container.on('error', (err) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeout);
+      if (abortSignal) {
+        abortSignal.removeEventListener('abort', abortHandler);
+      }
       cleanupCid();
       logger.error({ group: group.name, error: err }, 'Container spawn error');
       resolve({
@@ -727,7 +843,8 @@ export async function runContainerAgent(
 
 async function runContainerAgentDaemon(
   group: RegisteredGroup,
-  input: ContainerInput
+  input: ContainerInput,
+  options?: { abortSignal?: AbortSignal }
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
   const groupDir = path.join(GROUPS_DIR, group.folder);
@@ -738,9 +855,33 @@ async function runContainerAgentDaemon(
 
   const { responsePath, requestPath } = writeAgentRequest(group.folder, input);
   const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+  const abortSignal = options?.abortSignal;
+  const containerName = getDaemonContainerName(group.folder);
+
+  const abortHandler = () => {
+    logger.warn({ group: group.name }, 'Daemon run preempted');
+    try {
+      if (fs.existsSync(requestPath)) fs.unlinkSync(requestPath);
+    } catch {
+      // ignore cleanup failure
+    }
+    spawn('docker', ['rm', '-f', containerName], { stdio: 'ignore' });
+  };
+
+  if (abortSignal) {
+    if (abortSignal.aborted) {
+      abortHandler();
+      return {
+        status: 'error',
+        result: null,
+        error: 'Daemon run preempted'
+      };
+    }
+    abortSignal.addEventListener('abort', abortHandler, { once: true });
+  }
 
   try {
-    const output = await waitForAgentResponse(responsePath, timeoutMs);
+    const output = await waitForAgentResponse(responsePath, timeoutMs, abortSignal);
     return {
       ...output,
       latency_ms: output.latency_ms ?? (Date.now() - startTime)
@@ -754,7 +895,6 @@ async function runContainerAgentDaemon(
       // ignore cleanup failure
     }
     try {
-      const containerName = getDaemonContainerName(group.folder);
       spawn('docker', ['rm', '-f', containerName], { stdio: 'ignore' });
     } catch {
       // ignore cleanup failure
@@ -764,6 +904,10 @@ async function runContainerAgentDaemon(
       result: null,
       error: errorMessage
     };
+  } finally {
+    if (abortSignal) {
+      abortSignal.removeEventListener('abort', abortHandler);
+    }
   }
 }
 

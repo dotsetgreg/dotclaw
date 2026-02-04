@@ -12,10 +12,11 @@ function runNpm(args) {
   execFileSync(npmCmd, args, { cwd: agentRunnerDir, stdio: 'inherit' });
 }
 
-if (!existsSync(nodeModulesDir)) {
-  if (process.env.CI && existsSync(packageLock)) {
+const skipInstall = ['1', 'true', 'yes'].includes((process.env.DOTCLAW_AGENT_RUNNER_SKIP_INSTALL || '').toLowerCase());
+if (!skipInstall) {
+  if (existsSync(packageLock)) {
     runNpm(['ci']);
-  } else {
+  } else if (!existsSync(nodeModulesDir)) {
     runNpm(['install']);
   }
 }

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { distPath, importFresh, withTempCwd } from './test-helpers.js';
+import { distPath, importFresh, withTempHome } from './test-helpers.js';
 
 function writeBehaviorConfig(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -19,64 +19,61 @@ function writeBehaviorConfig(filePath) {
 
 test('personalization applies preference memories with conflict keys', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-personal-'));
-  await withTempCwd(tempDir, async () => {
-    const prevBehaviorPath = process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH;
-    process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH = path.join(tempDir, 'behavior.json');
-    writeBehaviorConfig(process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH);
+  await withTempHome(tempDir, async () => {
+    // Create required directories
+    const configDir = path.join(tempDir, 'config');
+    const storeDir = path.join(tempDir, 'data', 'store');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(storeDir, { recursive: true });
 
-    try {
-      const { initMemoryStore, upsertMemoryItems } = await importFresh(distPath('memory-store.js'));
-      const { loadPersonalizedBehaviorConfig } = await importFresh(distPath('personalization.js'));
+    const behaviorPath = path.join(configDir, 'behavior.json');
+    writeBehaviorConfig(behaviorPath);
 
-      initMemoryStore();
+    const { initMemoryStore, upsertMemoryItems } = await importFresh(distPath('memory-store.js'));
+    const { loadPersonalizedBehaviorConfig } = await importFresh(distPath('personalization.js'));
 
-      upsertMemoryItems('main', [
-        {
-          scope: 'group',
-          type: 'preference',
-          conflict_key: 'caution_bias',
-          content: 'Be cautious with uncertain claims.',
-          tags: ['caution_bias:0.7'],
-          metadata: { caution_bias: 0.7 },
-          importance: 0.7,
-          confidence: 0.8
-        },
-        {
-          scope: 'user',
-          subject_id: 'user-1',
-          type: 'preference',
-          conflict_key: 'response_style',
-          content: 'Prefers concise responses.',
-          tags: ['response_style:concise'],
-          metadata: { response_style: 'concise' },
-          importance: 0.8,
-          confidence: 0.9
-        },
-        {
-          scope: 'user',
-          subject_id: 'user-1',
-          type: 'preference',
-          conflict_key: 'tool_calling_bias',
-          content: 'Use tools proactively when needed.',
-          tags: ['tool_calling_bias:0.7'],
-          metadata: { tool_calling_bias: 0.7 },
-          importance: 0.7,
-          confidence: 0.9
-        }
-      ], 'test');
+    initMemoryStore();
 
-      const personalized = loadPersonalizedBehaviorConfig({ groupFolder: 'main', userId: 'user-1' });
-
-      assert.equal(personalized.response_style, 'concise');
-      assert.equal(personalized.tool_calling_bias, 0.7);
-      assert.equal(personalized.caution_bias, 0.7);
-      assert.equal(personalized.memory_importance_threshold, 0.6);
-    } finally {
-      if (prevBehaviorPath === undefined) {
-        delete process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH;
-      } else {
-        process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH = prevBehaviorPath;
+    upsertMemoryItems('main', [
+      {
+        scope: 'group',
+        type: 'preference',
+        conflict_key: 'caution_bias',
+        content: 'Be cautious with uncertain claims.',
+        tags: ['caution_bias:0.7'],
+        metadata: { caution_bias: 0.7 },
+        importance: 0.7,
+        confidence: 0.8
+      },
+      {
+        scope: 'user',
+        subject_id: 'user-1',
+        type: 'preference',
+        conflict_key: 'response_style',
+        content: 'Prefers concise responses.',
+        tags: ['response_style:concise'],
+        metadata: { response_style: 'concise' },
+        importance: 0.8,
+        confidence: 0.9
+      },
+      {
+        scope: 'user',
+        subject_id: 'user-1',
+        type: 'preference',
+        conflict_key: 'tool_calling_bias',
+        content: 'Use tools proactively when needed.',
+        tags: ['tool_calling_bias:0.7'],
+        metadata: { tool_calling_bias: 0.7 },
+        importance: 0.7,
+        confidence: 0.9
       }
-    }
+    ], 'test');
+
+    const personalized = loadPersonalizedBehaviorConfig({ groupFolder: 'main', userId: 'user-1' });
+
+    assert.equal(personalized.response_style, 'concise');
+    assert.equal(personalized.tool_calling_bias, 0.7);
+    assert.equal(personalized.caution_bias, 0.7);
+    assert.equal(personalized.memory_importance_threshold, 0.6);
   });
 });

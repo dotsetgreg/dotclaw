@@ -7,16 +7,12 @@
  * Allowlist location: ~/.config/dotclaw/mount-allowlist.json
  */
 
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import pino from 'pino';
 import { MOUNT_ALLOWLIST_PATH } from './config.js';
 import { AdditionalMount, MountAllowlist, AllowedRoot } from './types.js';
-
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport: { target: 'pino-pretty', options: { colorize: true } }
-});
+import { logger } from './logger.js';
 
 // Cache the allowlist in memory - only reloads on process restart
 let cachedAllowlist: MountAllowlist | null = null;
@@ -113,7 +109,7 @@ export function loadMountAllowlist(): MountAllowlist | null {
  * Expand ~ to home directory and resolve to absolute path
  */
 function expandPath(p: string): string {
-  const homeDir = process.env.HOME || '/Users/user';
+  const homeDir = os.homedir();
   if (p.startsWith('~/')) {
     return path.join(homeDir, p.slice(2));
   }
@@ -347,38 +343,4 @@ export function validateAdditionalMounts(
   }
 
   return validatedMounts;
-}
-
-/**
- * Generate a template allowlist file for users to customize
- */
-export function generateAllowlistTemplate(): string {
-  const template: MountAllowlist = {
-    allowedRoots: [
-      {
-        path: '~/projects',
-        allowReadWrite: true,
-        description: 'Development projects'
-      },
-      {
-        path: '~/repos',
-        allowReadWrite: true,
-        description: 'Git repositories'
-      },
-      {
-        path: '~/Documents/work',
-        allowReadWrite: false,
-        description: 'Work documents (read-only)'
-      }
-    ],
-    blockedPatterns: [
-      // Additional patterns beyond defaults
-      'password',
-      'secret',
-      'token'
-    ],
-    nonMainReadOnly: true
-  };
-
-  return JSON.stringify(template, null, 2);
 }

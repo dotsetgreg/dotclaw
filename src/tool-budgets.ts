@@ -1,6 +1,6 @@
-import path from 'path';
-import { DATA_DIR } from './config.js';
+import { TOOL_BUDGETS_PATH } from './paths.js';
 import { loadJson } from './utils.js';
+import { loadRuntimeConfig } from './runtime-config.js';
 import { getToolUsageCounts } from './db.js';
 import { ToolPolicy } from './tool-policy.js';
 
@@ -14,7 +14,9 @@ export interface ToolBudgetConfig {
   users?: Record<string, ToolBudget>;
 }
 
-const DEFAULT_PATH = path.join(DATA_DIR, 'tool-budgets.json');
+const runtime = loadRuntimeConfig();
+
+const DEFAULT_PATH = runtime.host.toolBudgets.path || TOOL_BUDGETS_PATH;
 
 function normalizeToolName(name: string): string {
   return name.trim().toLowerCase();
@@ -40,7 +42,18 @@ function mergeBudgets(base: ToolBudget, override?: ToolBudget): ToolBudget {
 }
 
 export function loadToolBudgetConfig(): ToolBudgetConfig {
-  return loadJson<ToolBudgetConfig>(process.env.DOTCLAW_TOOL_BUDGETS_PATH || DEFAULT_PATH, {});
+  const fallback: ToolBudgetConfig = {
+    default: {
+      per_day: {
+        WebSearch: 30,
+        WebFetch: 30,
+        Bash: 15,
+        GitClone: 10,
+        NpmInstall: 5
+      }
+    }
+  };
+  return loadJson<ToolBudgetConfig>(DEFAULT_PATH, fallback);
 }
 
 export function applyToolBudgets(params: {
@@ -48,8 +61,7 @@ export function applyToolBudgets(params: {
   userId?: string | null;
   toolPolicy: ToolPolicy;
 }): ToolPolicy {
-  const enabled = !['0', 'false', 'no', 'off'].includes((process.env.DOTCLAW_TOOL_BUDGETS_ENABLED || '').toLowerCase());
-  if (!enabled) return params.toolPolicy;
+    if (!runtime.host.toolBudgets.enabled) return params.toolPolicy;
 
   const config = loadToolBudgetConfig();
   const base = mergeBudgets({ per_day: {} }, config.default);

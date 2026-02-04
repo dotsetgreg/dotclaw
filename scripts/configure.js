@@ -1,11 +1,15 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import readline from 'readline';
 
-const PROJECT_ROOT = process.cwd();
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const ENV_PATH = path.join(PROJECT_ROOT, '.env');
-const MODEL_CONFIG_PATH = path.join(DATA_DIR, 'model.json');
+// Get DOTCLAW_HOME from environment or default to ~/.dotclaw
+const DOTCLAW_HOME = process.env.DOTCLAW_HOME || path.join(os.homedir(), '.dotclaw');
+const CONFIG_DIR = path.join(DOTCLAW_HOME, 'config');
+const DATA_DIR = path.join(DOTCLAW_HOME, 'data');
+const ENV_PATH = path.join(DOTCLAW_HOME, '.env');
+const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
+const RUNTIME_CONFIG_PATH = path.join(CONFIG_DIR, 'runtime.json');
 
 function parseEnv(content) {
   const lines = content.split('\n');
@@ -66,11 +70,27 @@ async function promptForValue(rl, label, currentValue, optional = false) {
   });
 }
 
+function loadRuntimeConfig() {
+  if (!fs.existsSync(RUNTIME_CONFIG_PATH)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(RUNTIME_CONFIG_PATH, 'utf-8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveRuntimeConfig(config) {
+  fs.mkdirSync(path.dirname(RUNTIME_CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(RUNTIME_CONFIG_PATH, JSON.stringify(config, null, 2) + '\n');
+}
+
 async function main() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
   const envContent = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf-8') : '';
   const envMap = parseEnv(envContent);
+  const runtimeConfig = loadRuntimeConfig();
 
   const nonInteractive = ['1', 'true', 'yes'].includes((process.env.DOTCLAW_CONFIGURE_NONINTERACTIVE || process.env.DOTCLAW_BOOTSTRAP_NONINTERACTIVE || '').toLowerCase());
 
@@ -87,22 +107,21 @@ async function main() {
     }
   }
 
+  const runtimeAgent = runtimeConfig.agent || {};
+  const runtimeOpenrouter = runtimeAgent.openrouter || {};
+
   let telegramToken = envMap.get('TELEGRAM_BOT_TOKEN') || '';
   let openrouterKey = envMap.get('OPENROUTER_API_KEY') || '';
-  let openrouterModel = envMap.get('OPENROUTER_MODEL') || modelConfig.model;
-  let openrouterSiteUrl = envMap.get('OPENROUTER_SITE_URL') || '';
-  let openrouterSiteName = envMap.get('OPENROUTER_SITE_NAME') || '';
+  let openrouterModel = modelConfig.model;
+  let openrouterSiteUrl = runtimeOpenrouter.siteUrl || '';
+  let openrouterSiteName = runtimeOpenrouter.siteName || '';
   let braveKey = envMap.get('BRAVE_SEARCH_API_KEY') || '';
   let allowlistInput = '';
 
   if (nonInteractive) {
     telegramToken = process.env.TELEGRAM_BOT_TOKEN || telegramToken;
     openrouterKey = process.env.OPENROUTER_API_KEY || openrouterKey;
-    openrouterModel = process.env.OPENROUTER_MODEL || openrouterModel;
-    openrouterSiteUrl = process.env.OPENROUTER_SITE_URL || openrouterSiteUrl;
-    openrouterSiteName = process.env.OPENROUTER_SITE_NAME || openrouterSiteName;
     braveKey = process.env.BRAVE_SEARCH_API_KEY || braveKey;
-    allowlistInput = process.env.DOTCLAW_MODEL_ALLOWLIST || '';
 
     if (!telegramToken) {
       console.error('TELEGRAM_BOT_TOKEN is required for non-interactive configuration.');
@@ -133,11 +152,8 @@ async function main() {
 
   const updates = {
     TELEGRAM_BOT_TOKEN: telegramToken,
-    OPENROUTER_API_KEY: openrouterKey,
-    OPENROUTER_MODEL: openrouterModel
+    OPENROUTER_API_KEY: openrouterKey
   };
-  if (openrouterSiteUrl) updates.OPENROUTER_SITE_URL = openrouterSiteUrl;
-  if (openrouterSiteName) updates.OPENROUTER_SITE_NAME = openrouterSiteName;
   if (braveKey) updates.BRAVE_SEARCH_API_KEY = braveKey;
 
   const nextEnv = updateEnvContent(envContent || '', updates);
@@ -160,6 +176,20 @@ async function main() {
   };
 
   fs.writeFileSync(MODEL_CONFIG_PATH, JSON.stringify(nextModelConfig, null, 2) + '\n');
+
+  const nextRuntimeConfig = { ...runtimeConfig };
+  if (!nextRuntimeConfig.agent) nextRuntimeConfig.agent = {};
+  if (!nextRuntimeConfig.agent.openrouter) nextRuntimeConfig.agent.openrouter = {};
+  nextRuntimeConfig.agent.openrouter.siteUrl = openrouterSiteUrl || '';
+  nextRuntimeConfig.agent.openrouter.siteName = openrouterSiteName || '';
+
+  if (!nextRuntimeConfig.host) nextRuntimeConfig.host = {};
+  if (!nextRuntimeConfig.host.memory) nextRuntimeConfig.host.memory = {};
+  if (!nextRuntimeConfig.host.memory.embeddings) nextRuntimeConfig.host.memory.embeddings = {};
+  nextRuntimeConfig.host.memory.embeddings.openrouterSiteUrl = openrouterSiteUrl || '';
+  nextRuntimeConfig.host.memory.embeddings.openrouterSiteName = openrouterSiteName || '';
+
+  saveRuntimeConfig(nextRuntimeConfig);
 
   console.log('Configuration updated.');
 }

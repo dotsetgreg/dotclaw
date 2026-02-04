@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { MAIN_GROUP_FOLDER, STORE_DIR } from './config.js';
+import { loadRuntimeConfig } from './runtime-config.js';
 
 export type MemoryScope = 'user' | 'group' | 'global';
 export type MemoryType =
@@ -66,6 +67,74 @@ export interface PreferenceMemory {
 const MEMORY_DB_PATH = path.join(STORE_DIR, 'memory.db');
 let memoryDb: Database.Database | null = null;
 let ftsEnabled = true;
+const MEMORY_SCHEMA_VERSION = 3;
+
+function getUserVersion(db: Database.Database): number {
+  const version = db.pragma('user_version', { simple: true }) as number;
+  return Number.isFinite(version) ? version : 0;
+}
+
+function setUserVersion(db: Database.Database, version: number): void {
+  db.pragma(`user_version = ${Math.max(0, Math.floor(version))}`);
+}
+
+function getMemoryColumns(db: Database.Database): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(memory_items)`).all() as Array<{ name?: string }>;
+  const columns = new Set<string>();
+  for (const row of rows) {
+    if (row?.name) columns.add(String(row.name));
+  }
+  return columns;
+}
+
+function ensureColumn(db: Database.Database, columns: Set<string>, name: string, ddl: string): void {
+  if (columns.has(name)) return;
+  db.exec(ddl);
+  columns.add(name);
+}
+
+function ensureMemorySchema(db: Database.Database): void {
+  const currentVersion = getUserVersion(db);
+  const columns = getMemoryColumns(db);
+
+  if (columns.size === 0) {
+    // Table might not exist yet; caller should have created it.
+    return;
+  }
+
+  ensureColumn(db, columns, 'embedding_json', `ALTER TABLE memory_items ADD COLUMN embedding_json TEXT`);
+  ensureColumn(db, columns, 'embedding_model', `ALTER TABLE memory_items ADD COLUMN embedding_model TEXT`);
+  ensureColumn(db, columns, 'embedding_updated_at', `ALTER TABLE memory_items ADD COLUMN embedding_updated_at TEXT`);
+  ensureColumn(db, columns, 'kind', `ALTER TABLE memory_items ADD COLUMN kind TEXT`);
+  ensureColumn(db, columns, 'conflict_key', `ALTER TABLE memory_items ADD COLUMN conflict_key TEXT`);
+  ensureColumn(db, columns, 'access_count', `ALTER TABLE memory_items ADD COLUMN access_count INTEGER DEFAULT 0`);
+  ensureColumn(db, columns, 'priority', `ALTER TABLE memory_items ADD COLUMN priority TEXT DEFAULT 'normal'`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_conflict ON memory_items(group_folder, scope, subject_id, type, conflict_key)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+  `);
+
+  if (currentVersion !== MEMORY_SCHEMA_VERSION) {
+    setUserVersion(db, MEMORY_SCHEMA_VERSION);
+  }
+}
+
+function getMemoryMeta(db: Database.Database, key: string): string | null {
+  const row = db.prepare(`SELECT value FROM memory_meta WHERE key = ?`).get(key) as { value?: string } | undefined;
+  return row?.value ?? null;
+}
+
+function setMemoryMeta(db: Database.Database, key: string, value: string): void {
+  db.prepare(`
+    INSERT INTO memory_meta (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
+}
 
 function getDb(): Database.Database {
   if (!memoryDb) {
@@ -150,26 +219,12 @@ export function initMemoryStore(): void {
     ftsEnabled = false;
   }
 
-  // Migrate existing DBs to include embedding columns.
   try {
-    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN embedding_json TEXT`);
-  } catch { /* already exists */ }
-  try {
-    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN embedding_model TEXT`);
-  } catch { /* already exists */ }
-  try {
-    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN embedding_updated_at TEXT`);
-  } catch { /* already exists */ }
-  try {
-    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN kind TEXT`);
-  } catch { /* already exists */ }
-  try {
-    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN conflict_key TEXT`);
-  } catch { /* already exists */ }
-
-  try {
-    memoryDb.exec(`CREATE INDEX IF NOT EXISTS idx_memory_conflict ON memory_items(group_folder, scope, subject_id, type, conflict_key)`);
-  } catch { /* column may be missing in older schemas */ }
+    ensureMemorySchema(memoryDb);
+  } catch (err) {
+    console.error(`[memory-store] Schema check failed: ${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
 }
 
 function normalizeContent(content: string): string {
@@ -638,6 +693,154 @@ export function cleanupExpiredMemories(): number {
   return info.changes;
 }
 
+/**
+ * Record memory access: update last_accessed_at, increment access_count, and boost importance
+ * Called when memories are recalled for context
+ */
+export function recordMemoryAccess(ids: string[]): void {
+  if (ids.length === 0) return;
+  const db = getDb();
+  const now = new Date().toISOString();
+
+  // Boost importance by 2% per access, capped at 1.0
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`
+    UPDATE memory_items
+    SET last_accessed_at = ?,
+        access_count = COALESCE(access_count, 0) + 1,
+        importance = MIN(1.0, importance + 0.02)
+    WHERE id IN (${placeholders})
+  `).run(now, ...ids);
+}
+
+/**
+ * Decay importance for memories not accessed recently
+ * Reduces importance by 1% for memories not accessed in 30+ days (minimum 0.1)
+ * Also doesn't decay critical priority memories
+ */
+export function decayUnusedMemories(): number {
+  const db = getDb();
+  const info = db.prepare(`
+    UPDATE memory_items
+    SET importance = MAX(0.1, importance - 0.01)
+    WHERE (last_accessed_at IS NULL OR last_accessed_at < datetime('now', '-30 days'))
+      AND importance > 0.1
+      AND (priority IS NULL OR priority != 'critical')
+  `).run();
+  return info.changes;
+}
+
+/**
+ * Set priority for a memory item
+ * Priority values: 'critical', 'normal', 'low'
+ * Critical memories are never pruned
+ */
+export function setMemoryPriority(id: string, priority: 'critical' | 'normal' | 'low'): boolean {
+  const db = getDb();
+  const info = db.prepare(`UPDATE memory_items SET priority = ? WHERE id = ?`).run(priority, id);
+  return info.changes > 0;
+}
+
+/**
+ * Get memory by ID
+ */
+export function getMemoryById(id: string): MemoryItem | null {
+  const db = getDb();
+  const row = db.prepare(`SELECT * FROM memory_items WHERE id = ?`).get(id);
+  return row ? (row as MemoryItem) : null;
+}
+
+export function pruneMemoryOverflow(params: { maxItems: number; importanceThreshold: number }): number {
+  const db = getDb();
+  const maxItems = Math.max(0, Math.floor(params.maxItems));
+  if (maxItems <= 0) return 0;
+  const total = db.prepare(`SELECT COUNT(*) as count FROM memory_items`).get() as { count: number };
+  if (!total || total.count <= maxItems) return 0;
+
+  let remaining = total.count - maxItems;
+  let removed = 0;
+
+  // First pass: delete low-importance items (excluding critical priority)
+  const deleteByThreshold = db.prepare(`
+    DELETE FROM memory_items
+    WHERE id IN (
+      SELECT id FROM memory_items
+      WHERE importance <= ?
+        AND (priority IS NULL OR priority != 'critical')
+      ORDER BY importance ASC, updated_at ASC
+      LIMIT ?
+    )
+  `);
+  const infoThreshold = deleteByThreshold.run(params.importanceThreshold, remaining);
+  removed += infoThreshold.changes;
+  remaining -= infoThreshold.changes;
+
+  // Second pass: delete by overflow (still excluding critical)
+  if (remaining > 0) {
+    const deleteByOverflow = db.prepare(`
+      DELETE FROM memory_items
+      WHERE id IN (
+        SELECT id FROM memory_items
+        WHERE (priority IS NULL OR priority != 'critical')
+        ORDER BY importance ASC, updated_at ASC
+        LIMIT ?
+      )
+    `);
+    const infoOverflow = deleteByOverflow.run(remaining);
+    removed += infoOverflow.changes;
+  }
+
+  return removed;
+}
+
+export function runMemoryMaintenance(): { expired: number; pruned: number; decayed: number; vacuumed: boolean; analyzed: boolean } {
+  const db = getDb();
+  const expired = cleanupExpiredMemories();
+
+  // Decay importance for unused memories
+  const decayed = decayUnusedMemories();
+
+  const runtime = loadRuntimeConfig();
+  const maintenance = runtime.host.memory.maintenance;
+  const maxItems = maintenance.maxItems;
+  const threshold = maintenance.pruneImportanceThreshold;
+  const pruned = pruneMemoryOverflow({ maxItems, importanceThreshold: threshold });
+
+  const shouldVacuum = maintenance.vacuumEnabled;
+  const vacuumIntervalDays = maintenance.vacuumIntervalDays;
+  const analyzeEnabled = maintenance.analyzeEnabled;
+
+  let vacuumed = false;
+  let analyzed = false;
+
+  if ((expired + pruned) > 0 && shouldVacuum && vacuumIntervalDays > 0) {
+    const now = Date.now();
+    const lastVacuumRaw = getMemoryMeta(db, 'last_vacuum_at');
+    const lastVacuum = lastVacuumRaw ? Date.parse(lastVacuumRaw) : 0;
+    const intervalMs = vacuumIntervalDays * 24 * 60 * 60 * 1000;
+    if (!Number.isFinite(lastVacuum) || (now - lastVacuum) >= intervalMs) {
+      try {
+        db.exec('VACUUM');
+        setMemoryMeta(db, 'last_vacuum_at', new Date(now).toISOString());
+        vacuumed = true;
+      } catch {
+        // ignore vacuum errors
+      }
+    }
+  }
+
+  if ((expired + pruned) > 0 && analyzeEnabled) {
+    try {
+      db.exec('ANALYZE');
+      analyzed = true;
+    } catch {
+      // ignore analyze errors
+    }
+  }
+
+  return { expired, pruned, decayed, vacuumed, analyzed };
+}
+
 export function buildUserProfile(params: {
   groupFolder: string;
   userId?: string | null;
@@ -656,37 +859,6 @@ export function buildUserProfile(params: {
   `).all(params.groupFolder, params.userId, limit) as Array<{ content: string; type: string }>;
   if (rows.length === 0) return null;
   return rows.map(row => `- (${row.type}) ${row.content}`).join('\n');
-}
-
-export function buildMemoryRecall(params: {
-  groupFolder: string;
-  userId?: string | null;
-  query: string;
-  maxResults?: number;
-  maxTokens?: number;
-}): string[] {
-  const results = searchMemories({
-    groupFolder: params.groupFolder,
-    userId: params.userId,
-    query: params.query,
-    limit: params.maxResults || 8
-  });
-
-  if (results.length === 0) return [];
-
-  const maxTokens = params.maxTokens || 1200;
-  const recall: string[] = [];
-  let tokens = 0;
-
-  for (const item of results) {
-    const line = `(${item.type}) ${item.content}`;
-    const estimate = Math.ceil(Buffer.byteLength(line, 'utf-8') / 4);
-    if (tokens + estimate > maxTokens) break;
-    recall.push(line);
-    tokens += estimate;
-  }
-
-  return recall;
 }
 
 export function listMemoriesMissingEmbeddings(params: {
@@ -714,6 +886,27 @@ export function listMemoriesMissingEmbeddings(params: {
     ORDER BY updated_at DESC
     LIMIT ?
   `).all(limit) as Array<{ id: string; content: string; group_folder: string }>;
+}
+
+export function countMemoriesMissingEmbeddings(params: { groupFolder?: string }): number {
+  const db = getDb();
+  if (params.groupFolder) {
+    const row = db.prepare(`
+      SELECT COUNT(*) as count
+      FROM memory_items
+      WHERE group_folder = ?
+        AND content IS NOT NULL
+        AND (embedding_json IS NULL OR embedding_json = '')
+    `).get(params.groupFolder) as { count?: number } | undefined;
+    return row?.count ? Number(row.count) : 0;
+  }
+  const row = db.prepare(`
+    SELECT COUNT(*) as count
+    FROM memory_items
+    WHERE content IS NOT NULL
+      AND (embedding_json IS NULL OR embedding_json = '')
+  `).get() as { count?: number } | undefined;
+  return row?.count ? Number(row.count) : 0;
 }
 
 export function updateMemoryEmbedding(params: {

@@ -7,8 +7,10 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { OpenRouter, stepCountIs } from '@openrouter/sdk';
-import { createTools, ToolCallRecord, ToolPolicy } from './tools.js';
+import { createTools, ToolCallRecord } from './tools.js';
 import { createIpcHandlers } from './ipc.js';
+import { loadAgentConfig } from './agent-config.js';
+import { OUTPUT_START_MARKER, OUTPUT_END_MARKER, type ContainerInput, type ContainerOutput } from './container-protocol.js';
 import {
   createSessionContext,
   appendHistory,
@@ -26,75 +28,24 @@ import {
 } from './memory.js';
 import { loadPromptPackWithCanary, formatTaskExtractionPack, formatResponseQualityPack, formatToolCallingPack, formatToolOutcomePack, formatMemoryPolicyPack, formatMemoryRecallPack, PromptPack } from './prompt-packs.js';
 
-export interface ContainerInput {
-  prompt: string;
-  sessionId?: string;
-  groupFolder: string;
-  chatJid: string;
-  isMain: boolean;
-  isScheduledTask?: boolean;
-  taskId?: string;
-  userId?: string;
-  userName?: string;
-  memoryRecall?: string[];
-  userProfile?: string | null;
-  memoryStats?: {
-    total: number;
-    user: number;
-    group: number;
-    global: number;
-  };
-  tokenEstimate?: {
-    tokens_per_char: number;
-    tokens_per_message: number;
-    tokens_per_request: number;
-  };
-  toolReliability?: Array<{
-    name: string;
-    success_rate: number;
-    count: number;
-    avg_duration_ms: number | null;
-  }>;
-  behaviorConfig?: Record<string, unknown>;
-  toolPolicy?: ToolPolicy;
-  modelOverride?: string;
-  modelContextTokens?: number;
-  modelMaxOutputTokens?: number;
-  modelTemperature?: number;
-}
-
-export interface ContainerOutput {
-  status: 'success' | 'error';
-  result: string | null;
-  newSessionId?: string;
-  error?: string;
-  model?: string;
-  prompt_pack_versions?: Record<string, string>;
-  memory_summary?: string;
-  memory_facts?: string[];
-  tokens_prompt?: number;
-  tokens_completion?: number;
-  memory_recall_count?: number;
-  session_recall_count?: number;
-  memory_items_upserted?: number;
-  memory_items_extracted?: number;
-  tool_calls?: ToolCallRecord[];
-  latency_ms?: number;
-}
-
-const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
 
 const SESSION_ROOT = '/workspace/session';
 const GROUP_DIR = '/workspace/group';
 const IPC_DIR = '/workspace/ipc';
 const GLOBAL_DIR = '/workspace/global';
 const PROMPTS_DIR = '/workspace/prompts';
+const AVAILABLE_GROUPS_PATH = '/workspace/ipc/available_groups.json';
+const GROUP_CLAUDE_PATH = path.join(GROUP_DIR, 'CLAUDE.md');
+const GLOBAL_CLAUDE_PATH = path.join(GLOBAL_DIR, 'CLAUDE.md');
+const CLAUDE_NOTES_MAX_CHARS = 4000;
 
-const PROMPT_PACKS_ENABLED = !['0', 'false', 'no', 'off'].includes((process.env.DOTCLAW_PROMPT_PACKS_ENABLED || '').toLowerCase());
-const PROMPT_PACKS_MAX_CHARS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_CHARS || '6000', 10);
-const PROMPT_PACKS_MAX_DEMOS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_DEMOS || '4', 10);
-const PROMPT_PACKS_CANARY_RATE = parseFloat(process.env.DOTCLAW_PROMPT_PACKS_CANARY_RATE || '0.1');
+const agentConfig = loadAgentConfig();
+const agent = agentConfig.agent;
+
+const PROMPT_PACKS_ENABLED = agent.promptPacks.enabled;
+const PROMPT_PACKS_MAX_CHARS = agent.promptPacks.maxChars;
+const PROMPT_PACKS_MAX_DEMOS = agent.promptPacks.maxDemos;
+const PROMPT_PACKS_CANARY_RATE = agent.promptPacks.canaryRate;
 
 let cachedOpenRouter: OpenRouter | null = null;
 let cachedOpenRouterKey = '';
@@ -165,11 +116,11 @@ async function runSelfCheck(params: {
     'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
     'Content-Type': 'application/json'
   };
-  if (process.env.OPENROUTER_SITE_URL) {
-    headers['HTTP-Referer'] = process.env.OPENROUTER_SITE_URL;
+  if (agent.openrouter.siteUrl) {
+    headers['HTTP-Referer'] = agent.openrouter.siteUrl;
   }
-  if (process.env.OPENROUTER_SITE_NAME) {
-    headers['X-Title'] = process.env.OPENROUTER_SITE_NAME;
+  if (agent.openrouter.siteName) {
+    headers['X-Title'] = agent.openrouter.siteName;
   }
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -213,21 +164,21 @@ async function readStdin(): Promise<string> {
   });
 }
 
-function getConfig(): MemoryConfig & {
+function getConfig(config: ReturnType<typeof loadAgentConfig>): MemoryConfig & {
   maxOutputTokens: number;
   summaryMaxOutputTokens: number;
   temperature: number;
 } {
   return {
-    maxContextTokens: parseInt(process.env.DOTCLAW_MAX_CONTEXT_TOKENS || '200000', 10),
-    compactionTriggerTokens: parseInt(process.env.DOTCLAW_COMPACTION_TRIGGER_TOKENS || '180000', 10),
-    recentContextTokens: parseInt(process.env.DOTCLAW_RECENT_CONTEXT_TOKENS || '80000', 10),
-    summaryUpdateEveryMessages: parseInt(process.env.DOTCLAW_SUMMARY_UPDATE_EVERY_MESSAGES || '12', 10),
-    memoryMaxResults: parseInt(process.env.DOTCLAW_MEMORY_MAX_RESULTS || '6', 10),
-    memoryMaxTokens: parseInt(process.env.DOTCLAW_MEMORY_MAX_TOKENS || '2000', 10),
-    maxOutputTokens: parseInt(process.env.DOTCLAW_MAX_OUTPUT_TOKENS || '4096', 10),
-    summaryMaxOutputTokens: parseInt(process.env.DOTCLAW_SUMMARY_MAX_OUTPUT_TOKENS || '1200', 10),
-    temperature: parseFloat(process.env.DOTCLAW_TEMPERATURE || '0.2')
+    maxContextTokens: config.agent.context.maxContextTokens,
+    compactionTriggerTokens: config.agent.context.compactionTriggerTokens,
+    recentContextTokens: config.agent.context.recentContextTokens,
+    summaryUpdateEveryMessages: config.agent.context.summaryUpdateEveryMessages,
+    memoryMaxResults: config.agent.memory.maxResults,
+    memoryMaxTokens: config.agent.memory.maxTokens,
+    maxOutputTokens: config.agent.context.maxOutputTokens,
+    summaryMaxOutputTokens: config.agent.context.summaryMaxOutputTokens,
+    temperature: config.agent.context.temperature
   };
 }
 
@@ -287,21 +238,9 @@ function formatPlanBlock(plan: { steps: string[]; tools: string[]; risks: string
   return lines.join('\n');
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function isEnabledEnv(name: string, defaultValue = true): boolean {
-  const value = (process.env[name] || '').toLowerCase().trim();
-  if (!value) return defaultValue;
-  return !['0', 'false', 'no', 'off'].includes(value);
-}
-
-function getOpenRouterOptions() {
-  const timeoutMs = parsePositiveInt(process.env.DOTCLAW_OPENROUTER_TIMEOUT_MS, 240_000);
-  const retryEnabled = isEnabledEnv('DOTCLAW_OPENROUTER_RETRY', true);
+function getOpenRouterOptions(config: ReturnType<typeof loadAgentConfig>) {
+  const timeoutMs = config.agent.openrouter.timeoutMs;
+  const retryEnabled = config.agent.openrouter.retry;
   const retryConfig = retryEnabled
     ? {
       strategy: 'backoff' as const,
@@ -318,15 +257,18 @@ function getOpenRouterOptions() {
   return {
     timeoutMs,
     retryConfig,
-    httpReferer: process.env.OPENROUTER_SITE_URL,
-    xTitle: process.env.OPENROUTER_SITE_NAME
+    httpReferer: config.agent.openrouter.siteUrl || undefined,
+    xTitle: config.agent.openrouter.siteName || undefined
   };
 }
 
-function resolveTokenEstimate(input: ContainerInput): { tokensPerChar: number; tokensPerMessage: number; tokensPerRequest: number } {
-  const fallbackChar = parseFloat(process.env.DOTCLAW_TOKENS_PER_CHAR || '0.25');
-  const fallbackMessage = parseFloat(process.env.DOTCLAW_TOKENS_PER_MESSAGE || '3');
-  const fallbackRequest = parseFloat(process.env.DOTCLAW_TOKENS_PER_REQUEST || '0');
+function resolveTokenEstimate(
+  input: ContainerInput,
+  config: ReturnType<typeof loadAgentConfig>
+): { tokensPerChar: number; tokensPerMessage: number; tokensPerRequest: number } {
+  const fallbackChar = config.agent.tokenEstimate.tokensPerChar;
+  const fallbackMessage = config.agent.tokenEstimate.tokensPerMessage;
+  const fallbackRequest = config.agent.tokenEstimate.tokensPerRequest;
   const tokensPerChar = Number.isFinite(input.tokenEstimate?.tokens_per_char)
     ? Number(input.tokenEstimate?.tokens_per_char)
     : fallbackChar;
@@ -360,15 +302,19 @@ function estimateMessagesTokens(messages: Message[], tokensPerChar: number, toke
 
 function buildSystemInstructions(params: {
   assistantName: string;
+  groupNotes?: string | null;
+  globalNotes?: string | null;
   memorySummary: string;
   memoryFacts: string[];
   sessionRecall: string[];
   longTermRecall: string[];
   userProfile?: string | null;
   memoryStats?: { total: number; user: number; group: number; global: number };
+  availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   toolReliability?: Array<{ name: string; success_rate: number; count: number; avg_duration_ms: number | null }>;
   behaviorConfig?: Record<string, unknown>;
   isScheduledTask: boolean;
+  isBackgroundTask: boolean;
   taskId?: string;
   planBlock?: string;
   taskExtractionPack?: PromptPack | null;
@@ -397,6 +343,12 @@ function buildSystemInstructions(params: {
     '- `mcp__dotclaw__memory_search`, `mcp__dotclaw__memory_list`, `mcp__dotclaw__memory_forget`, `mcp__dotclaw__memory_stats`.',
     '- `plugin__*`: dynamically loaded plugin tools (if present and allowed by policy).'
   ].join('\n');
+  const browserAutomation = [
+    'Browser automation (via Bash):',
+    '- Use `agent-browser open <url>` then `agent-browser snapshot -i`.',
+    '- Interact with refs using `agent-browser click @e1`, `fill @e2 "text"`.',
+    '- Capture evidence with `agent-browser screenshot`.'
+  ].join('\n');
 
   const memorySummary = params.memorySummary ? params.memorySummary : 'None yet.';
   const memoryFacts = params.memoryFacts.length > 0
@@ -417,6 +369,15 @@ function buildSystemInstructions(params: {
   const memoryStats = params.memoryStats
     ? `Total: ${params.memoryStats.total}, User: ${params.memoryStats.user}, Group: ${params.memoryStats.group}, Global: ${params.memoryStats.global}`
     : 'Unknown.';
+
+  const availableGroups = params.availableGroups && params.availableGroups.length > 0
+    ? params.availableGroups
+      .map(group => `- ${group.name} (chat ${group.jid}, last: ${group.lastActivity})`)
+      .join('\n')
+    : 'None.';
+
+  const groupNotes = params.groupNotes ? `Group notes:\n${params.groupNotes}` : '';
+  const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
 
   const toolReliability = params.toolReliability && params.toolReliability.length > 0
     ? params.toolReliability
@@ -459,6 +420,9 @@ function buildSystemInstructions(params: {
 
   const scheduledNote = params.isScheduledTask
     ? `You are running as a scheduled task${params.taskId ? ` (task id: ${params.taskId})` : ''}. If you need to communicate, use \`mcp__dotclaw__send_message\`.`
+    : '';
+  const backgroundNote = params.isBackgroundTask
+    ? 'You are running in the background for a user request. Focus on completing the task and return a complete response without asking follow-up questions unless strictly necessary.'
     : '';
 
   const taskExtractionBlock = params.taskExtractionPack
@@ -512,7 +476,11 @@ function buildSystemInstructions(params: {
   return [
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
     scheduledNote,
+    backgroundNote,
     toolsDoc,
+    browserAutomation,
+    groupNotes,
+    globalNotes,
     params.planBlock || '',
     toolCallingBlock,
     toolOutcomeBlock,
@@ -532,12 +500,45 @@ function buildSystemInstructions(params: {
     sessionRecall,
     'Memory stats:',
     memoryStats,
+    'Available groups (main group only):',
+    availableGroups,
     'Tool reliability (recent):',
     toolReliability,
     behaviorNotes.length > 0 ? `Behavior notes:\n${behaviorNotes.join('\n')}` : '',
     behaviorConfig,
     'Respond succinctly and helpfully. If you perform tool actions, summarize the results.'
   ].filter(Boolean).join('\n\n');
+}
+
+function loadAvailableGroups(): Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }> {
+  try {
+    if (!fs.existsSync(AVAILABLE_GROUPS_PATH)) return [];
+    const raw = JSON.parse(fs.readFileSync(AVAILABLE_GROUPS_PATH, 'utf-8')) as {
+      groups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
+    };
+    return Array.isArray(raw.groups) ? raw.groups.filter(group => group && typeof group.jid === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function readTextFileLimited(filePath: string, maxChars: number): string | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8').trim();
+    if (!content) return null;
+    if (content.length <= maxChars) return content;
+    return `${content.slice(0, maxChars)}\n\n[Truncated for length]`;
+  } catch {
+    return null;
+  }
+}
+
+function loadClaudeNotes(): { group: string | null; global: string | null } {
+  return {
+    group: readTextFileLimited(GROUP_CLAUDE_PATH, CLAUDE_NOTES_MAX_CHARS),
+    global: readTextFileLimited(GLOBAL_CLAUDE_PATH, CLAUDE_NOTES_MAX_CHARS)
+  };
 }
 
 function extractQueryFromPrompt(prompt: string): string {
@@ -563,6 +564,23 @@ function messagesToOpenRouter(messages: Message[]) {
     role: message.role,
     content: message.content
   }));
+}
+
+function clampContextMessages(messages: Message[], tokensPerChar: number, maxTokens: number): Message[] {
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) return messages;
+  const tpc = tokensPerChar > 0 ? tokensPerChar : 0.25;
+  const maxBytes = Math.max(200, Math.floor(maxTokens / tpc));
+  const suffix = '\n\n[Context truncated for length]';
+  const suffixBytes = Buffer.byteLength(suffix, 'utf-8');
+  return messages.map(message => {
+    const contentBytes = Buffer.byteLength(message.content, 'utf-8');
+    if (contentBytes <= maxBytes) return message;
+    const budget = Math.max(0, maxBytes - suffixBytes);
+    const truncated = Buffer.from(message.content, 'utf-8')
+      .subarray(0, budget)
+      .toString('utf-8');
+    return { ...message, content: `${truncated}${suffix}` };
+  });
 }
 
 async function updateMemorySummary(params: {
@@ -655,6 +673,93 @@ function parseMemoryExtraction(text: string): Array<Record<string, unknown>> {
   }
 }
 
+type ResponseValidation = {
+  verdict: 'pass' | 'fail';
+  issues: string[];
+  missing: string[];
+};
+
+function buildResponseValidationPrompt(params: { userPrompt: string; response: string }): { instructions: string; input: string } {
+  const instructions = [
+    'You are a strict response quality checker.',
+    'Given a user request and an assistant response, decide if the response fully addresses the request.',
+    'Fail if the response is empty, generic, deflects, promises work without results, or ignores any explicit questions.',
+    'Pass only if the response directly answers all parts with concrete, relevant content.',
+    'Return JSON only with keys: verdict ("pass"|"fail"), issues (array of strings), missing (array of strings).'
+  ].join('\n');
+
+  const input = [
+    'User request:',
+    params.userPrompt,
+    '',
+    'Assistant response:',
+    params.response
+  ].join('\n');
+
+  return { instructions, input };
+}
+
+function parseResponseValidation(text: string): ResponseValidation | null {
+  const trimmed = text.trim();
+  let jsonText = trimmed;
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch) {
+    jsonText = fenceMatch[1].trim();
+  }
+  try {
+    const parsed = JSON.parse(jsonText);
+    const verdict = parsed?.verdict;
+    if (verdict !== 'pass' && verdict !== 'fail') return null;
+    const issues = Array.isArray(parsed?.issues)
+      ? parsed.issues.filter((issue: unknown) => typeof issue === 'string')
+      : [];
+    const missing = Array.isArray(parsed?.missing)
+      ? parsed.missing.filter((item: unknown) => typeof item === 'string')
+      : [];
+    return { verdict, issues, missing };
+  } catch {
+    return null;
+  }
+}
+
+async function validateResponseQuality(params: {
+  openrouter: OpenRouter;
+  model: string;
+  userPrompt: string;
+  response: string;
+  maxOutputTokens: number;
+  temperature: number;
+}): Promise<ResponseValidation | null> {
+  const prompt = buildResponseValidationPrompt({
+    userPrompt: params.userPrompt,
+    response: params.response
+  });
+  const result = await params.openrouter.callModel({
+    model: params.model,
+    instructions: prompt.instructions,
+    input: prompt.input,
+    maxOutputTokens: params.maxOutputTokens,
+    temperature: params.temperature
+  });
+  const text = await result.getText();
+  return parseResponseValidation(text);
+}
+
+function buildRetryGuidance(validation: ResponseValidation | null): string {
+  const issues = validation?.issues || [];
+  const missing = validation?.missing || [];
+  const points = [...issues, ...missing].filter(Boolean).slice(0, 8);
+  const details = points.length > 0
+    ? points.map(item => `- ${item}`).join('\n')
+    : '- The previous response did not fully address the request.';
+  return [
+    'IMPORTANT: Your previous response did not fully answer the user request.',
+    'Provide a direct, complete answer now. Do not mention this retry.',
+    'Issues to fix:',
+    details
+  ].join('\n');
+}
+
 function buildPlannerTrigger(pattern: string | undefined): RegExp | null {
   if (!pattern) return null;
   try {
@@ -695,11 +800,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     };
   }
 
-  const model = input.modelOverride || process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
-  const summaryModel = process.env.DOTCLAW_SUMMARY_MODEL || model;
-  const memoryModel = process.env.DOTCLAW_MEMORY_MODEL || summaryModel;
-  const assistantName = process.env.ASSISTANT_NAME || 'Rain';
-  const config = getConfig();
+  const model = input.modelOverride || agentConfig.defaultModel;
+  const summaryModel = agent.models.summary;
+  const memoryModel = agent.models.memory;
+  const assistantName = agent.assistantName;
+  const config = getConfig(agentConfig);
   if (input.modelContextTokens && Number.isFinite(input.modelContextTokens)) {
     config.maxContextTokens = Math.min(config.maxContextTokens, input.modelContextTokens);
     const compactionTarget = input.modelContextTokens - config.maxOutputTokens;
@@ -711,25 +816,52 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   if (input.modelTemperature && Number.isFinite(input.modelTemperature)) {
     config.temperature = input.modelTemperature;
   }
-  const openrouterOptions = getOpenRouterOptions();
-  const maxToolSteps = parsePositiveInt(process.env.DOTCLAW_MAX_TOOL_STEPS, 32);
-  const memoryExtractionEnabled = isEnabledEnv('DOTCLAW_MEMORY_EXTRACTION_ENABLED', true);
+  const openrouterOptions = getOpenRouterOptions(agentConfig);
+  const maxToolSteps = agent.tools.maxToolSteps;
+  const memoryExtractionEnabled = agent.memory.extraction.enabled;
   const isDaemon = process.env.DOTCLAW_DAEMON === '1';
-  const memoryExtractionAsync = isEnabledEnv('DOTCLAW_MEMORY_EXTRACTION_ASYNC', isDaemon);
-  const memoryExtractionMaxMessages = parsePositiveInt(process.env.DOTCLAW_MEMORY_EXTRACTION_MESSAGES, 8);
-  const memoryExtractionMaxOutputTokens = parsePositiveInt(process.env.DOTCLAW_MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS, 900);
-  const memoryExtractScheduled = isEnabledEnv('DOTCLAW_MEMORY_EXTRACT_SCHEDULED', false);
-  const memoryArchiveSync = isEnabledEnv('DOTCLAW_MEMORY_ARCHIVE_SYNC', true);
-  const plannerEnabled = isEnabledEnv('DOTCLAW_PLANNER_ENABLED', true);
-  const plannerMode = (process.env.DOTCLAW_PLANNER_MODE || 'auto').toLowerCase();
-  const plannerMinTokens = parsePositiveInt(process.env.DOTCLAW_PLANNER_MIN_TOKENS, 200);
-  const plannerTrigger = buildPlannerTrigger(process.env.DOTCLAW_PLANNER_TRIGGER_REGEX);
-  const plannerModel = process.env.DOTCLAW_PLANNER_MODEL || model;
-  const plannerMaxOutputTokens = parsePositiveInt(process.env.DOTCLAW_PLANNER_MAX_OUTPUT_TOKENS, 400);
-  const plannerTemperature = parseFloat(process.env.DOTCLAW_PLANNER_TEMPERATURE || '0.2');
+  const memoryExtractionAsync = agent.memory.extraction.async;
+  const memoryExtractionMaxMessages = agent.memory.extraction.maxMessages;
+  const memoryExtractionMaxOutputTokens = agent.memory.extraction.maxOutputTokens;
+  const memoryExtractScheduled = agent.memory.extractScheduled;
+  const memoryArchiveSync = agent.memory.archiveSync;
+  const plannerEnabled = agent.planner.enabled;
+  const plannerMode = String(agent.planner.mode || 'auto').toLowerCase();
+  const plannerMinTokens = agent.planner.minTokens;
+  const plannerTrigger = buildPlannerTrigger(agent.planner.triggerRegex);
+  const plannerModel = agent.models.planner;
+  const plannerMaxOutputTokens = agent.planner.maxOutputTokens;
+  const plannerTemperature = agent.planner.temperature;
+  const responseValidateEnabled = agent.responseValidation.enabled;
+  const responseValidateModel = agent.models.responseValidation;
+  const responseValidateMaxOutputTokens = agent.responseValidation.maxOutputTokens;
+  const responseValidateTemperature = agent.responseValidation.temperature;
+  const responseValidateMaxRetries = agent.responseValidation.maxRetries;
+  const responseValidateAllowToolCalls = agent.responseValidation.allowToolCalls;
+  const maxContextMessageTokens = agent.context.maxContextMessageTokens;
+  const streamingEnabled = Boolean(input.streaming?.enabled && typeof input.streaming?.draftId === 'number');
+  const streamingDraftId = streamingEnabled ? input.streaming?.draftId : undefined;
+  const streamingMinIntervalMs = Math.max(
+    0,
+    Math.floor(
+      typeof input.streaming?.minIntervalMs === 'number'
+        ? input.streaming.minIntervalMs
+        : agent.streaming.minIntervalMs
+    )
+  );
+  const streamingMinChars = Math.max(
+    1,
+    Math.floor(
+      typeof input.streaming?.minChars === 'number'
+        ? input.streaming.minChars
+        : agent.streaming.minChars
+    )
+  );
 
   const openrouter = getCachedOpenRouter(apiKey, openrouterOptions);
-  const tokenEstimate = resolveTokenEstimate(input);
+  const tokenEstimate = resolveTokenEstimate(input, agentConfig);
+  const availableGroups = loadAvailableGroups();
+  const claudeNotes = loadClaudeNotes();
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
   const toolCalls: ToolCallRecord[] = [];
@@ -739,17 +871,32 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
     isMain: input.isMain
-  });
+  }, agent.ipc);
   const tools = createTools({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
     isMain: input.isMain
-  }, {
+  }, agent, {
     onToolCall: (call) => {
       toolCalls.push(call);
     },
     policy: input.toolPolicy
   });
+
+  let streamLastSentAt = 0;
+  let streamLastSentLength = 0;
+  const sendStreamUpdate = (text: string, force = false) => {
+    if (!streamingEnabled || !streamingDraftId) return;
+    if (!text || !text.trim()) return;
+    const now = Date.now();
+    if (!force) {
+      if (now - streamLastSentAt < streamingMinIntervalMs) return;
+      if (text.length - streamLastSentLength < streamingMinChars) return;
+    }
+    streamLastSentAt = now;
+    streamLastSentLength = text.length;
+    void ipc.sendDraft(text, streamingDraftId).catch(() => undefined);
+  };
 
   if (process.env.DOTCLAW_SELF_CHECK === '1') {
     try {
@@ -903,15 +1050,19 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
   const buildInstructions = (planBlockValue: string) => buildSystemInstructions({
     assistantName,
+    groupNotes: claudeNotes.group,
+    globalNotes: claudeNotes.global,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
     sessionRecall,
     longTermRecall: input.memoryRecall || [],
     userProfile: input.userProfile ?? null,
     memoryStats: input.memoryStats,
+    availableGroups,
     toolReliability: input.toolReliability,
     behaviorConfig: input.behaviorConfig,
     isScheduledTask: !!input.isScheduledTask,
+    isBackgroundTask: !!input.isBackgroundTask,
     taskId: input.taskId,
     planBlock: planBlockValue,
     taskExtractionPack: taskPackResult?.pack || null,
@@ -927,7 +1078,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   let instructionsTokens = estimateTokensForModel(instructions, tokenEstimate.tokensPerChar);
   let maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
   let adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
-  let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6);
+  let { recentMessages: plannerContextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6);
+  plannerContextMessages = clampContextMessages(plannerContextMessages, tokenEstimate.tokensPerChar, maxContextMessageTokens);
 
   if (shouldRunPlanner({
     enabled: plannerEnabled,
@@ -938,7 +1090,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     trigger: plannerTrigger
   })) {
     try {
-      const plannerPrompt = buildPlannerPrompt(contextMessages);
+      const plannerPrompt = buildPlannerPrompt(plannerContextMessages);
       const plannerResult = await openrouter.callModel({
         model: plannerModel,
         instructions: plannerPrompt.instructions,
@@ -961,43 +1113,161 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     instructionsTokens = estimateTokensForModel(instructions, tokenEstimate.tokensPerChar);
     maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
     adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
-    ({ recentMessages: contextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6));
+    ({ recentMessages: plannerContextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6));
+    plannerContextMessages = clampContextMessages(plannerContextMessages, tokenEstimate.tokensPerChar, maxContextMessageTokens);
   }
 
-  const promptTokens = instructionsTokens
-    + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
-    + tokenEstimate.tokensPerRequest;
+  const buildContext = (extraInstruction?: string) => {
+    let resolvedInstructions = buildInstructions(planBlock);
+    if (extraInstruction) {
+      resolvedInstructions = `${resolvedInstructions}\n\n${extraInstruction}`;
+    }
+    const resolvedInstructionTokens = estimateTokensForModel(resolvedInstructions, tokenEstimate.tokensPerChar);
+    const resolvedMaxContext = Math.max(config.maxContextTokens - config.maxOutputTokens - resolvedInstructionTokens, 2000);
+    const resolvedAdjusted = Math.max(1000, Math.floor(resolvedMaxContext * tokenRatio));
+    let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, resolvedAdjusted, 6);
+    contextMessages = clampContextMessages(contextMessages, tokenEstimate.tokensPerChar, maxContextMessageTokens);
+    return {
+      instructions: resolvedInstructions,
+      instructionsTokens: resolvedInstructionTokens,
+      contextMessages
+    };
+  };
 
   let responseText = '';
   let completionTokens = 0;
+  let promptTokens = 0;
+  let modelToolCalls: Array<{ name: string }> = [];
 
   let latencyMs: number | undefined;
-  try {
+  const runCompletion = async (extraInstruction?: string): Promise<{
+    responseText: string;
+    completionTokens: number;
+    promptTokens: number;
+    latencyMs?: number;
+    modelToolCalls: Array<{ name: string }>;
+  }> => {
+    const { instructions: resolvedInstructions, instructionsTokens: resolvedInstructionTokens, contextMessages } = buildContext(extraInstruction);
+    const resolvedPromptTokens = resolvedInstructionTokens
+      + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
+      + tokenEstimate.tokensPerRequest;
+
     log('Starting OpenRouter call...');
     const startedAt = Date.now();
-    const result = await openrouter.callModel({
+    const callParams = {
       model,
-      instructions,
+      instructions: resolvedInstructions,
       input: messagesToOpenRouter(contextMessages),
       tools,
       stopWhen: stepCountIs(maxToolSteps),
       maxOutputTokens: config.maxOutputTokens,
-      temperature: config.temperature
-    });
-    latencyMs = Date.now() - startedAt;
-    // Get tool calls to see what the model did
-    const modelToolCalls = await result.getToolCalls();
-    if (modelToolCalls.length > 0) {
-      log(`Model made ${modelToolCalls.length} tool call(s): ${modelToolCalls.map(t => t.name).join(', ')}`);
+      temperature: config.temperature,
+      stream: streamingEnabled
+    };
+    const result = await openrouter.callModel(callParams as Parameters<typeof openrouter.callModel>[0]);
+    const localLatencyMs = Date.now() - startedAt;
+    const toolCallsFromModel = await result.getToolCalls();
+    if (toolCallsFromModel.length > 0) {
+      log(`Model made ${toolCallsFromModel.length} tool call(s): ${toolCallsFromModel.map(t => t.name).join(', ')}`);
     }
 
-    responseText = await result.getText();
-    completionTokens = estimateTokensForModel(responseText || '', tokenEstimate.tokensPerChar);
-
-    if (!responseText || !responseText.trim()) {
-      log(`Warning: Model returned empty/whitespace response. Raw length: ${responseText?.length ?? 0}, tool calls: ${modelToolCalls.length}`);
+    let localResponseText = '';
+    let streamed = false;
+    if (streamingEnabled && typeof (result as { getTextStream?: () => AsyncIterable<unknown> }).getTextStream === 'function') {
+      try {
+        const stream = (result as { getTextStream: () => AsyncIterable<unknown> }).getTextStream();
+        for await (const chunk of stream) {
+          const delta = typeof chunk === 'string'
+            ? chunk
+            : (typeof (chunk as { text?: unknown })?.text === 'string' ? (chunk as { text?: string }).text || '' : '');
+          if (!delta) continue;
+          localResponseText += delta;
+          sendStreamUpdate(localResponseText);
+        }
+        if (localResponseText) {
+          sendStreamUpdate(localResponseText, true);
+        }
+        streamed = true;
+      } catch (err) {
+        log(`Streaming failed, falling back to full response: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (!streamed || !localResponseText || !localResponseText.trim()) {
+      localResponseText = await result.getText();
+      if (localResponseText && localResponseText.trim()) {
+        sendStreamUpdate(localResponseText, true);
+      }
+    }
+    if (!localResponseText || !localResponseText.trim()) {
+      if (toolCallsFromModel.length > 0) {
+        localResponseText = 'I started running tool calls but did not get a final response. If you want me to continue, please ask a narrower subtask or say "continue".';
+      }
+      log(`Warning: Model returned empty/whitespace response. Raw length: ${localResponseText?.length ?? 0}, tool calls: ${toolCallsFromModel.length}`);
     } else {
-      log(`Model returned text response (${responseText.length} chars)`);
+      log(`Model returned text response (${localResponseText.length} chars)`);
+    }
+
+    const localCompletionTokens = estimateTokensForModel(localResponseText || '', tokenEstimate.tokensPerChar);
+    return {
+      responseText: localResponseText,
+      completionTokens: localCompletionTokens,
+      promptTokens: resolvedPromptTokens,
+      latencyMs: localLatencyMs,
+      modelToolCalls: toolCallsFromModel
+    };
+  };
+
+  try {
+    const firstAttempt = await runCompletion();
+    responseText = firstAttempt.responseText;
+    completionTokens = firstAttempt.completionTokens;
+    promptTokens = firstAttempt.promptTokens;
+    latencyMs = firstAttempt.latencyMs;
+    modelToolCalls = firstAttempt.modelToolCalls;
+
+    const shouldValidate = responseValidateEnabled
+      && (responseValidateAllowToolCalls || modelToolCalls.length === 0);
+    if (shouldValidate) {
+      let retriesLeft = responseValidateMaxRetries;
+      while (true) {
+        if (!responseValidateAllowToolCalls && modelToolCalls.length > 0) {
+          break;
+        }
+        let validationResult: ResponseValidation | null = null;
+        if (!responseText || !responseText.trim()) {
+          validationResult = { verdict: 'fail', issues: ['Response was empty.'], missing: [] };
+        } else {
+          try {
+            validationResult = await validateResponseQuality({
+              openrouter,
+              model: responseValidateModel,
+              userPrompt: query,
+              response: responseText,
+              maxOutputTokens: responseValidateMaxOutputTokens,
+              temperature: responseValidateTemperature
+            });
+          } catch (err) {
+            log(`Response validation failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        if (!validationResult || validationResult.verdict === 'pass') {
+          break;
+        }
+        if (retriesLeft <= 0) {
+          break;
+        }
+        retriesLeft -= 1;
+        log(`Response validation failed; retrying (${retriesLeft} retries left)`);
+        streamLastSentAt = 0;
+        streamLastSentLength = 0;
+        const retryGuidance = buildRetryGuidance(validationResult);
+        const retryAttempt = await runCompletion(retryGuidance);
+        responseText = retryAttempt.responseText;
+        completionTokens = retryAttempt.completionTokens;
+        promptTokens = retryAttempt.promptTokens;
+        latencyMs = retryAttempt.latencyMs;
+        modelToolCalls = retryAttempt.modelToolCalls;
+      }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

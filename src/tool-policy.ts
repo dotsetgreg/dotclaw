@@ -1,5 +1,4 @@
-import path from 'path';
-import { DATA_DIR } from './config.js';
+import { TOOL_POLICY_PATH } from './paths.js';
 import { loadJson } from './utils.js';
 
 export interface ToolPolicy {
@@ -27,6 +26,7 @@ const DEFAULT_POLICY: ToolPolicy = {
     'WebSearch',
     'WebFetch',
     'Bash',
+    'Python',
     'mcp__dotclaw__send_message',
     'mcp__dotclaw__schedule_task',
     'mcp__dotclaw__list_tasks',
@@ -47,13 +47,14 @@ const DEFAULT_POLICY: ToolPolicy = {
   deny: [],
   max_per_run: {
     Bash: 4,
+    Python: 4,
     WebSearch: 5,
     WebFetch: 6
   },
   default_max_per_run: 32
 };
 
-const POLICY_PATH = path.join(DATA_DIR, 'tool-policy.json');
+const POLICY_PATH = TOOL_POLICY_PATH;
 
 export function loadToolPolicyConfig(): ToolPolicyConfig {
   return loadJson<ToolPolicyConfig>(POLICY_PATH, {});
@@ -94,4 +95,12 @@ export function getEffectiveToolPolicy(params: {
   const userPolicy = params.userId ? config.users?.[params.userId] : undefined;
   const merged = mergePolicy(mergePolicy(base, groupPolicy), userPolicy);
   return merged;
+}
+
+
+export function mergeToolPolicyDeny(policy: ToolPolicy, denyList: string[]): ToolPolicy {
+  if (!denyList.length) return policy;
+  const existing = Array.isArray(policy.deny) ? policy.deny : [];
+  const merged = Array.from(new Set([...existing, ...denyList]));
+  return { ...policy, deny: merged };
 }

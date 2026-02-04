@@ -12,13 +12,16 @@ const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const REQUESTS_DIR = path.join(IPC_DIR, 'requests');
 const RESPONSES_DIR = path.join(IPC_DIR, 'responses');
-const DEFAULT_REQUEST_TIMEOUT_MS = parseInt(process.env.DOTCLAW_IPC_REQUEST_TIMEOUT_MS || '6000', 10);
-const DEFAULT_REQUEST_POLL_MS = parseInt(process.env.DOTCLAW_IPC_REQUEST_POLL_MS || '150', 10);
 
 export interface IpcContext {
   chatJid: string;
   groupFolder: string;
   isMain: boolean;
+}
+
+export interface IpcConfig {
+  requestTimeoutMs: number;
+  requestPollMs: number;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -38,7 +41,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function requestResponse(type: string, payload: Record<string, unknown>, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+async function requestResponse(
+  type: string,
+  payload: Record<string, unknown>,
+  config: IpcConfig,
+  timeoutMs = config.requestTimeoutMs
+) {
   fs.mkdirSync(REQUESTS_DIR, { recursive: true });
   fs.mkdirSync(RESPONSES_DIR, { recursive: true });
 
@@ -63,13 +71,13 @@ async function requestResponse(type: string, payload: Record<string, unknown>, t
         return { ok: false, error: 'Failed to parse IPC response' };
       }
     }
-    await sleep(DEFAULT_REQUEST_POLL_MS);
+    await sleep(config.requestPollMs);
   }
 
   return { ok: false, error: `IPC request timeout (${timeoutMs}ms)` };
 }
 
-export function createIpcHandlers(ctx: IpcContext) {
+export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
   const { chatJid, groupFolder, isMain } = ctx;
 
   return {
@@ -78,6 +86,18 @@ export function createIpcHandlers(ctx: IpcContext) {
         type: 'message',
         chatJid,
         text,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendDraft(text: string, draftId: number) {
+      const data = {
+        type: 'message_draft',
+        chatJid,
+        text,
+        draftId,
         groupFolder,
         timestamp: new Date().toISOString()
       };
@@ -235,7 +255,7 @@ export function createIpcHandlers(ctx: IpcContext) {
       if (!isMain) {
         return { ok: false, error: 'Only the main group can list groups.' };
       }
-      return requestResponse('list_groups', {});
+      return requestResponse('list_groups', {}, config);
     },
 
     async setModel(args: { model: string; scope?: 'global' | 'group' | 'user'; target_id?: string }) {
@@ -259,7 +279,7 @@ export function createIpcHandlers(ctx: IpcContext) {
         items: args.items,
         source: args.source,
         target_group: args.target_group
-      });
+      }, config);
     },
 
     async memoryForget(args: { ids?: string[]; content?: string; scope?: string; userId?: string; target_group?: string }) {
@@ -269,7 +289,7 @@ export function createIpcHandlers(ctx: IpcContext) {
         scope: args.scope,
         userId: args.userId,
         target_group: args.target_group
-      });
+      }, config);
     },
 
     async memoryList(args: { scope?: string; type?: string; userId?: string; limit?: number; target_group?: string }) {
@@ -279,7 +299,7 @@ export function createIpcHandlers(ctx: IpcContext) {
         userId: args.userId,
         limit: args.limit,
         target_group: args.target_group
-      });
+      }, config);
     },
 
     async memorySearch(args: { query: string; userId?: string; limit?: number; target_group?: string }) {
@@ -288,14 +308,14 @@ export function createIpcHandlers(ctx: IpcContext) {
         userId: args.userId,
         limit: args.limit,
         target_group: args.target_group
-      });
+      }, config);
     },
 
     async memoryStats(args: { userId?: string; target_group?: string }) {
       return requestResponse('memory_stats', {
         userId: args.userId,
         target_group: args.target_group
-      });
+      }, config);
     }
   };
 }

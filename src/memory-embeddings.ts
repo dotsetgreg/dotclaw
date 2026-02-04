@@ -1,36 +1,22 @@
-import { listMemoriesMissingEmbeddings, updateMemoryEmbedding } from './memory-store.js';
+import { countMemoriesMissingEmbeddings, listMemoriesMissingEmbeddings, updateMemoryEmbedding } from './memory-store.js';
+import { loadRuntimeConfig } from './runtime-config.js';
+import { logger } from './logger.js';
 
-const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+const runtime = loadRuntimeConfig();
+const config = runtime.host.memory.embeddings;
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
+export const EMBEDDINGS_ENABLED = config.enabled;
+export const EMBEDDING_MODEL = config.model;
+export const EMBEDDING_BATCH_SIZE = config.batchSize;
+export const EMBEDDING_MIN_ITEMS = config.minItems;
+export const EMBEDDING_MIN_QUERY_CHARS = config.minQueryChars;
+export const EMBEDDING_MAX_CANDIDATES = config.maxCandidates;
+export const EMBEDDING_WEIGHT = config.weight;
+export const EMBEDDING_INTERVAL_MS = config.intervalMs;
+export const EMBEDDING_MAX_BACKLOG = config.maxBacklog;
 
-function parsePositiveFloat(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function isEnabledEnv(name: string, defaultValue = true): boolean {
-  const value = (process.env[name] || '').toLowerCase().trim();
-  if (!value) return defaultValue;
-  return !['0', 'false', 'no', 'off'].includes(value);
-}
-
-export const EMBEDDINGS_ENABLED = isEnabledEnv('DOTCLAW_MEMORY_EMBEDDINGS_ENABLED', true);
-export const EMBEDDING_MODEL = process.env.DOTCLAW_MEMORY_EMBEDDING_MODEL || 'openai/text-embedding-3-small';
-export const EMBEDDING_BATCH_SIZE = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_BATCH_SIZE, 8);
-export const EMBEDDING_MIN_ITEMS = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_MIN_ITEMS, 20);
-export const EMBEDDING_MIN_QUERY_CHARS = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_MIN_QUERY_CHARS, 40);
-export const EMBEDDING_MAX_CANDIDATES = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_MAX_CANDIDATES, 2000);
-export const EMBEDDING_WEIGHT = parsePositiveFloat(process.env.DOTCLAW_MEMORY_EMBEDDING_WEIGHT, 0.6);
-export const EMBEDDING_INTERVAL_MS = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_INTERVAL_MS, 300000);
-
-const QUERY_CACHE_TTL_MS = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_QUERY_CACHE_MS, 600000);
-const QUERY_CACHE_MAX = parsePositiveInt(process.env.DOTCLAW_MEMORY_EMBEDDING_QUERY_CACHE_MAX, 200);
+const QUERY_CACHE_TTL_MS = config.queryCacheTtlMs;
+const QUERY_CACHE_MAX = config.queryCacheMax;
 
 const queryCache = new Map<string, { embedding: number[]; expiresAt: number }>();
 
@@ -52,18 +38,17 @@ async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
   if (!apiKey) {
     throw new Error('OPENROUTER_API_KEY is not set');
   }
-  const baseUrl = process.env.OPENROUTER_BASE_URL || DEFAULT_BASE_URL;
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${apiKey}`,
     'Content-Type': 'application/json'
   };
-  if (process.env.OPENROUTER_SITE_URL) {
-    headers['HTTP-Referer'] = process.env.OPENROUTER_SITE_URL;
+  if (config.openrouterSiteUrl) {
+    headers['HTTP-Referer'] = config.openrouterSiteUrl;
   }
-  if (process.env.OPENROUTER_SITE_NAME) {
-    headers['X-Title'] = process.env.OPENROUTER_SITE_NAME;
+  if (config.openrouterSiteName) {
+    headers['X-Title'] = config.openrouterSiteName;
   }
-  const response = await fetch(`${baseUrl}/embeddings`, {
+  const response = await fetch(`${config.openrouterBaseUrl}/embeddings`, {
     method: 'POST',
     headers,
     body: JSON.stringify({
@@ -101,6 +86,13 @@ export async function getQueryEmbedding(query: string): Promise<number[] | null>
 
 export async function backfillEmbeddings(): Promise<number> {
   if (!EMBEDDINGS_ENABLED) return 0;
+  if (EMBEDDING_MAX_BACKLOG > 0) {
+    const backlog = countMemoriesMissingEmbeddings({});
+    if (backlog > EMBEDDING_MAX_BACKLOG) {
+      logger.warn({ backlog, limit: EMBEDDING_MAX_BACKLOG }, 'Embedding backlog exceeds limit; skipping backfill');
+      return 0;
+    }
+  }
   const missing = listMemoriesMissingEmbeddings({ limit: EMBEDDING_BATCH_SIZE });
   if (missing.length === 0) return 0;
   const texts = missing.map(item => item.content);

@@ -1,15 +1,17 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { execSync } from 'child_process';
 
-const PROJECT_ROOT = process.cwd();
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const GROUPS_DIR = path.join(PROJECT_ROOT, 'groups');
-const STORE_DIR = path.join(PROJECT_ROOT, 'store');
-const HOME_DIR = process.env.HOME || '';
-const DOTCLAW_CONFIG_DIR = HOME_DIR ? path.join(HOME_DIR, '.config', 'dotclaw') : '';
-const TRACE_DIR = DOTCLAW_CONFIG_DIR ? path.join(DOTCLAW_CONFIG_DIR, 'traces') : '';
-const PROMPTS_DIR = DOTCLAW_CONFIG_DIR ? path.join(DOTCLAW_CONFIG_DIR, 'prompts') : '';
+// Get DOTCLAW_HOME from environment or default to ~/.dotclaw
+const DOTCLAW_HOME = process.env.DOTCLAW_HOME || path.join(os.homedir(), '.dotclaw');
+const CONFIG_DIR = path.join(DOTCLAW_HOME, 'config');
+const DATA_DIR = path.join(DOTCLAW_HOME, 'data');
+const GROUPS_DIR = path.join(DOTCLAW_HOME, 'groups');
+const STORE_DIR = path.join(DATA_DIR, 'store');
+const LOGS_DIR = path.join(DOTCLAW_HOME, 'logs');
+const TRACES_DIR = path.join(DOTCLAW_HOME, 'traces');
+const PROMPTS_DIR = path.join(DOTCLAW_HOME, 'prompts');
 
 function log(label, value) {
   console.log(`${label}: ${value}`);
@@ -69,6 +71,16 @@ function diskSpace(dir) {
   }
 }
 
+function loadRuntimeConfig() {
+  const runtimePath = path.join(CONFIG_DIR, 'runtime.json');
+  if (!fs.existsSync(runtimePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(runtimePath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
 log('Node', process.version);
 if (typeof process.getuid === 'function') {
   log('UID', String(process.getuid()));
@@ -77,49 +89,52 @@ if (typeof process.getgid === 'function') {
   log('GID', String(process.getgid()));
 }
 checkDocker();
-log('Project Root', PROJECT_ROOT);
+log('DOTCLAW_HOME', DOTCLAW_HOME);
+checkPathAccess('config/', CONFIG_DIR);
 checkPathAccess('data/', DATA_DIR);
 checkPathAccess('groups/', GROUPS_DIR);
-checkPathAccess('store/', STORE_DIR);
-log('Disk space (data/)', diskSpace(DATA_DIR));
-log('Disk space (groups/)', diskSpace(GROUPS_DIR));
-log('Disk space (store/)', diskSpace(STORE_DIR));
+checkPathAccess('data/store/', STORE_DIR);
+checkPathAccess('logs/', LOGS_DIR);
+log('Disk space', diskSpace(DOTCLAW_HOME));
 
-if (DOTCLAW_CONFIG_DIR) {
-  checkPathAccess('~/.config/dotclaw', DOTCLAW_CONFIG_DIR);
-  log('Trace files', String(countFiles(TRACE_DIR)));
-  log('Prompt packs', String(countFiles(PROMPTS_DIR)));
+const runtimeConfig = loadRuntimeConfig();
+if (runtimeConfig) {
+  log('runtime.json', 'present');
+  const containerMode = runtimeConfig?.host?.container?.mode;
+  if (containerMode) {
+    log('Container mode', String(containerMode));
+  }
+  const maxAgents = runtimeConfig?.host?.concurrency?.maxAgents;
+  if (Number.isFinite(maxAgents)) {
+    log('Max concurrent agents', String(maxAgents));
+  }
+  const warmStart = runtimeConfig?.host?.concurrency?.warmStart;
+  if (typeof warmStart === 'boolean') {
+    log('Warm start', String(warmStart));
+  }
+  const blockPrivate = runtimeConfig?.agent?.tools?.webfetch?.blockPrivate;
+  if (typeof blockPrivate === 'boolean') {
+    log('WebFetch block private', String(blockPrivate));
+  }
+  const traceDir = runtimeConfig?.host?.trace?.dir || TRACES_DIR;
+  const promptsDir = runtimeConfig?.host?.promptPacksDir || PROMPTS_DIR;
+  log('Trace files', String(countFiles(traceDir)));
+  log('Prompt packs', String(countFiles(promptsDir)));
+} else {
+  log('runtime.json', 'missing');
 }
 
-const envPath = path.join(PROJECT_ROOT, '.env');
+const envPath = path.join(DOTCLAW_HOME, '.env');
 log('.env', fs.existsSync(envPath) ? 'present' : 'missing');
 
 if (fs.existsSync(envPath)) {
   const envContent = fs.readFileSync(envPath, 'utf-8');
   const hasOpenRouter = envContent.includes('OPENROUTER_API_KEY=');
   const hasBrave = envContent.includes('BRAVE_SEARCH_API_KEY=');
+  const hasTelegram = envContent.includes('TELEGRAM_BOT_TOKEN=');
+  log('TELEGRAM_BOT_TOKEN', hasTelegram ? 'set' : 'missing');
   log('OPENROUTER_API_KEY', hasOpenRouter ? 'set' : 'missing');
   log('BRAVE_SEARCH_API_KEY', hasBrave ? 'set (optional, enables WebSearch)' : 'missing');
-
-  const containerModeMatch = envContent.match(/^DOTCLAW_CONTAINER_MODE=(.+)$/m);
-  if (containerModeMatch) {
-    log('Container mode', containerModeMatch[1].trim());
-  }
-
-  const maxConcurrentMatch = envContent.match(/^DOTCLAW_MAX_CONCURRENT_AGENTS=(.+)$/m);
-  if (maxConcurrentMatch) {
-    log('Max concurrent agents', maxConcurrentMatch[1].trim());
-  }
-
-  const warmStartMatch = envContent.match(/^DOTCLAW_WARM_START=(.+)$/m);
-  if (warmStartMatch) {
-    log('Warm start', warmStartMatch[1].trim());
-  }
-
-  const blockPrivateMatch = envContent.match(/^DOTCLAW_WEBFETCH_BLOCK_PRIVATE=(.+)$/m);
-  if (blockPrivateMatch) {
-    log('WebFetch block private', blockPrivateMatch[1].trim());
-  }
 }
 
 checkSystemd('dotclaw.service');
@@ -129,7 +144,7 @@ if (typeof process.getuid === 'function' && process.getuid() === 0) {
   log('Warning', 'Running as root. For best security, run as a non-root user.');
 }
 
-const modelConfigPath = path.join(DATA_DIR, 'model.json');
+const modelConfigPath = path.join(CONFIG_DIR, 'model.json');
 if (fs.existsSync(modelConfigPath)) {
   try {
     const modelConfig = JSON.parse(fs.readFileSync(modelConfigPath, 'utf-8'));
@@ -142,11 +157,8 @@ if (fs.existsSync(modelConfigPath)) {
   log('Model config', 'missing');
 }
 
-const behaviorConfigPath = process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH
-  || (DOTCLAW_CONFIG_DIR ? path.join(DOTCLAW_CONFIG_DIR, 'behavior.json') : '');
-if (behaviorConfigPath) {
-  log('Behavior config', fs.existsSync(behaviorConfigPath) ? behaviorConfigPath : 'missing');
-}
+const behaviorConfigPath = path.join(CONFIG_DIR, 'behavior.json');
+log('Behavior config', fs.existsSync(behaviorConfigPath) ? behaviorConfigPath : 'missing');
 
 const memoryDbPath = path.join(STORE_DIR, 'memory.db');
 log('Memory DB', fs.existsSync(memoryDbPath) ? 'present' : 'missing');

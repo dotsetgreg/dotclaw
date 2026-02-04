@@ -1,0 +1,6 @@
+agent-runner/node_modules
+agent-runner/dist
+agent-runner/.tsbuildinfo
+agent-runner/*.tsbuildinfo
+**/*.log
+**/.DS_Store

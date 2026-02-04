@@ -3,7 +3,8 @@
     "per_day": {
       "WebSearch": 50,
       "WebFetch": 50,
-      "Bash": 20
+      "Bash": 20,
+      "Python": 15
     }
   },
   "groups": {

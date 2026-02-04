@@ -1,0 +1,6 @@
+node_modules
+container/agent-runner/node_modules
+container/agent-runner/dist
+container/agent-runner/.tsbuildinfo
+container/agent-runner/*.tsbuildinfo
+**/*.log

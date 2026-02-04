@@ -6,6 +6,7 @@ import net from 'net';
 import { tool as sdkTool, type Tool } from '@openrouter/sdk';
 import { z } from 'zod';
 import { createIpcHandlers, IpcContext } from './ipc.js';
+import type { AgentRuntimeConfig } from './agent-config.js';
 
 type ToolConfig = {
   name: string;
@@ -20,12 +21,84 @@ type ToolConfig = {
 
 const tool = sdkTool as unknown as (config: ToolConfig) => Tool;
 
-const DEFAULT_TOOL_OUTPUT_LIMIT = parseInt(process.env.DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES || '1500000', 10);
-const DEFAULT_BASH_TIMEOUT_MS = parseInt(process.env.DOTCLAW_BASH_TIMEOUT_MS || '120000', 10);
-const DEFAULT_BASH_OUTPUT_LIMIT = parseInt(process.env.DOTCLAW_BASH_OUTPUT_LIMIT_BYTES || '200000', 10);
-const DEFAULT_WEBFETCH_MAX_BYTES = parseInt(process.env.DOTCLAW_WEBFETCH_MAX_BYTES || '1500000', 10);
-const DEFAULT_GREP_MAX_FILE_BYTES = parseInt(process.env.DOTCLAW_GREP_MAX_FILE_BYTES || '1000000', 10);
-const DEFAULT_PLUGIN_MAX_BYTES = parseInt(process.env.DOTCLAW_PLUGIN_MAX_BYTES || '800000', 10);
+type ToolRuntime = {
+  outputLimitBytes: number;
+  bashTimeoutMs: number;
+  bashOutputLimitBytes: number;
+  webfetchMaxBytes: number;
+  webfetchTimeoutMs: number;
+  websearchTimeoutMs: number;
+  pluginHttpTimeoutMs: number;
+  grepMaxFileBytes: number;
+  pluginMaxBytes: number;
+  toolSummary: {
+    enabled: boolean;
+    maxBytes: number;
+    model: string;
+    maxOutputTokens: number;
+    tools: string[];
+    timeoutMs: number;
+  };
+  openrouter: {
+    siteUrl: string;
+    siteName: string;
+  };
+  enableBash: boolean;
+  enableWebSearch: boolean;
+  enableWebFetch: boolean;
+  webfetchBlockPrivate: boolean;
+  webfetchAllowlist: string[];
+  webfetchBlocklist: string[];
+  pluginDirs: string[];
+};
+
+function buildToolRuntime(config: AgentRuntimeConfig['agent']): ToolRuntime {
+  const webfetchAllowlist = (config.tools.webfetch.allowlist || [])
+    .map(normalizeDomain)
+    .filter(Boolean);
+  const webfetchBlocklist = (config.tools.webfetch.blocklist || [])
+    .map(normalizeDomain)
+    .filter(Boolean);
+  const pluginDirs = Array.from(new Set([
+    ...config.tools.plugin.dirs,
+    ...DEFAULT_PLUGIN_DIRS
+  ]));
+  const toolSummaryTools = (config.tools.toolSummary.tools || [])
+    .map(toolName => toolName.trim().toLowerCase())
+    .filter(Boolean);
+  const toolSummaryTimeoutMs = Math.min(config.openrouter.timeoutMs, 30_000);
+
+  return {
+    outputLimitBytes: config.tools.outputLimitBytes,
+    bashTimeoutMs: config.tools.bash.timeoutMs,
+    bashOutputLimitBytes: config.tools.bash.outputLimitBytes,
+    webfetchMaxBytes: config.tools.webfetch.maxBytes,
+    webfetchTimeoutMs: config.tools.webfetch.timeoutMs,
+    websearchTimeoutMs: config.tools.websearch.timeoutMs,
+    pluginHttpTimeoutMs: config.tools.plugin.httpTimeoutMs,
+    grepMaxFileBytes: config.tools.grepMaxFileBytes,
+    pluginMaxBytes: config.tools.plugin.maxBytes,
+    toolSummary: {
+      enabled: config.tools.toolSummary.enabled,
+      maxBytes: config.tools.toolSummary.maxBytes,
+      model: config.models.toolSummary,
+      maxOutputTokens: config.tools.toolSummary.maxOutputTokens,
+      tools: toolSummaryTools,
+      timeoutMs: toolSummaryTimeoutMs
+    },
+    openrouter: {
+      siteUrl: config.openrouter.siteUrl,
+      siteName: config.openrouter.siteName
+    },
+    enableBash: config.tools.enableBash,
+    enableWebSearch: config.tools.enableWebSearch,
+    enableWebFetch: config.tools.enableWebFetch,
+    webfetchBlockPrivate: config.tools.webfetch.blockPrivate,
+    webfetchAllowlist,
+    webfetchBlocklist,
+    pluginDirs
+  };
+}
 
 const WORKSPACE_GROUP = '/workspace/group';
 const WORKSPACE_GLOBAL = '/workspace/global';
@@ -111,18 +184,80 @@ function limitText(text: string, maxBytes: number): { text: string; truncated: b
   return { text: truncated, truncated: true };
 }
 
-function isEnabled(envName: string, defaultValue = true): boolean {
-  const value = (process.env[envName] || '').toLowerCase().trim();
-  if (!value) return defaultValue;
-  return !['0', 'false', 'no', 'off'].includes(value);
-}
-
 function normalizeDomain(value: string): string {
   let normalized = value.trim().toLowerCase();
   normalized = normalized.replace(/^[a-z]+:\/\//, '');
   normalized = normalized.split('/')[0];
   normalized = normalized.split(':')[0];
   return normalized;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number,
+  label: string
+): Promise<Response> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return fetch(url, options);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    const name = err instanceof Error ? err.name : '';
+    if (name === 'AbortError') {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchWithRedirects(params: {
+  url: string;
+  options: RequestInit;
+  timeoutMs: number;
+  label: string;
+  allowlist: string[];
+  blocklist: string[];
+  blockPrivate: boolean;
+  maxRedirects?: number;
+}): Promise<Response> {
+  let currentUrl = params.url;
+  let options: RequestInit = { ...params.options, redirect: 'manual' };
+  const maxRedirects = Number.isFinite(params.maxRedirects) ? Number(params.maxRedirects) : 5;
+  let redirectsRemaining = maxRedirects;
+
+  while (true) {
+    const response = await fetchWithTimeout(currentUrl, options, params.timeoutMs, params.label);
+    const status = response.status;
+    const location = response.headers.get('location');
+    if (status >= 300 && status < 400 && location) {
+      if (redirectsRemaining <= 0) {
+        throw new Error(`Too many redirects fetching ${params.url}`);
+      }
+      redirectsRemaining -= 1;
+      const nextUrl = new URL(location, currentUrl).toString();
+      await assertUrlAllowed({
+        url: nextUrl,
+        allowlist: params.allowlist,
+        blocklist: params.blocklist,
+        blockPrivate: params.blockPrivate
+      });
+      const method = (options.method || 'GET').toUpperCase();
+      const forceGet = status === 303 || ((status === 301 || status === 302) && method === 'POST');
+      if (forceGet) {
+        options = { ...options, method: 'GET' };
+        delete (options as { body?: unknown }).body;
+      }
+      currentUrl = nextUrl;
+      continue;
+    }
+    return response;
+  }
 }
 
 function isLocalHostname(hostname: string): boolean {
@@ -220,7 +355,7 @@ async function assertUrlAllowed(params: {
   }
 }
 
-function sanitizeToolArgs(name: string, args: unknown): unknown {
+function sanitizeToolArgs(args: unknown): unknown {
   if (!args || typeof args !== 'object') return args;
   const record = { ...(args as Record<string, unknown>) };
 
@@ -319,12 +454,7 @@ function buildInputSchema(config: PluginConfig) {
   return z.object(shape).passthrough();
 }
 
-function loadPluginConfigs(): PluginConfig[] {
-  const configuredDirs = (process.env.DOTCLAW_PLUGIN_DIRS || '')
-    .split(',')
-    .map(dir => dir.trim())
-    .filter(Boolean);
-  const dirs = configuredDirs.length > 0 ? configuredDirs : DEFAULT_PLUGIN_DIRS;
+function loadPluginConfigs(dirs: string[]): PluginConfig[] {
   const configs: PluginConfig[] = [];
 
   for (const dir of dirs) {
@@ -483,19 +613,220 @@ async function readFileSafe(filePath: string, maxBytes: number) {
 }
 
 async function readResponseWithLimit(response: Response, maxBytes: number): Promise<{ body: Buffer; truncated: boolean }> {
-  const contentLength = response.headers.get('content-length');
-  if (contentLength && parseInt(contentLength, 10) > maxBytes) {
-    return { body: Buffer.alloc(0), truncated: true };
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength <= maxBytes) {
+      return { body: Buffer.from(buffer), truncated: false };
+    }
+    return { body: Buffer.from(buffer).subarray(0, maxBytes), truncated: true };
   }
-  const buffer = await response.arrayBuffer();
-  if (buffer.byteLength <= maxBytes) {
-    return { body: Buffer.from(buffer), truncated: false };
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value || value.byteLength === 0) continue;
+    const remaining = maxBytes - total;
+    if (remaining <= 0) {
+      truncated = true;
+      break;
+    }
+    if (value.byteLength > remaining) {
+      chunks.push(value.subarray(0, remaining));
+      total += remaining;
+      truncated = true;
+      break;
+    }
+    chunks.push(value);
+    total += value.byteLength;
+    if (total >= maxBytes) {
+      truncated = true;
+      break;
+    }
   }
-  return { body: Buffer.from(buffer).subarray(0, maxBytes), truncated: true };
+
+  if (truncated) {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+  }
+
+  return { body: Buffer.concat(chunks, total), truncated };
 }
 
-export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLogger; policy?: ToolPolicy }) {
-  const ipc = createIpcHandlers(ctx);
+type ToolSummaryPayload = {
+  text: string;
+  metadata: {
+    toolName: string;
+    url?: string;
+    status?: number;
+    contentType?: string | null;
+    truncated?: boolean;
+  };
+  apply: (summary: string) => unknown;
+};
+
+function toolSummaryMatches(name: string, patterns: string[]): boolean {
+  if (patterns.length === 0) return false;
+  const normalized = name.toLowerCase();
+  for (const pattern of patterns) {
+    if (pattern === '*') return true;
+    if (pattern.endsWith('*')) {
+      const prefix = pattern.slice(0, -1);
+      if (normalized.startsWith(prefix)) return true;
+    } else if (normalized === pattern) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getToolSummaryPayload(name: string, result: unknown): ToolSummaryPayload | null {
+  if (!result || typeof result !== 'object') return null;
+  const record = result as Record<string, unknown>;
+
+  if (name === 'WebFetch' && typeof record.content === 'string') {
+    return {
+      text: record.content,
+      metadata: {
+        toolName: name,
+        url: typeof record.url === 'string' ? record.url : undefined,
+        status: typeof record.status === 'number' ? record.status : undefined,
+        contentType: typeof record.contentType === 'string' ? record.contentType : undefined,
+        truncated: Boolean(record.truncated)
+      },
+      apply: (summary) => ({
+        ...record,
+        content: summary,
+        truncated: true
+      })
+    };
+  }
+
+  if (name.startsWith('plugin__') && typeof record.body === 'string') {
+    return {
+      text: record.body,
+      metadata: {
+        toolName: name,
+        status: typeof record.status === 'number' ? record.status : undefined,
+        contentType: typeof record.contentType === 'string' ? record.contentType : undefined,
+        truncated: Boolean(record.truncated)
+      },
+      apply: (summary) => ({
+        ...record,
+        body: summary,
+        truncated: true
+      })
+    };
+  }
+
+  return null;
+}
+
+function buildOpenRouterHeaders(runtime: ToolRuntime): Record<string, string> | null {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json'
+  };
+  if (runtime.openrouter.siteUrl) {
+    headers['HTTP-Referer'] = runtime.openrouter.siteUrl;
+  }
+  if (runtime.openrouter.siteName) {
+    headers['X-Title'] = runtime.openrouter.siteName;
+  }
+  return headers;
+}
+
+async function summarizeToolOutput(payload: ToolSummaryPayload, runtime: ToolRuntime, maxInputBytes: number): Promise<string | null> {
+  const headers = buildOpenRouterHeaders(runtime);
+  if (!headers) return null;
+
+  const { text, truncated: inputTruncated } = limitText(payload.text, maxInputBytes);
+  if (!text.trim()) return null;
+
+  const metadataLines = [
+    `Tool: ${payload.metadata.toolName}`,
+    payload.metadata.url ? `URL: ${payload.metadata.url}` : null,
+    typeof payload.metadata.status === 'number' ? `Status: ${payload.metadata.status}` : null,
+    payload.metadata.contentType ? `Content-Type: ${payload.metadata.contentType}` : null,
+    `Original bytes: ${Buffer.byteLength(payload.text, 'utf-8')}`,
+    `Original truncated: ${payload.metadata.truncated ? 'true' : 'false'}`,
+    `Input truncated for summary: ${inputTruncated ? 'true' : 'false'}`
+  ].filter(Boolean).join('\n');
+
+  const systemPrompt = [
+    'You summarize tool output for downstream reasoning.',
+    'Return a concise, factual summary with key entities, products, and dates.',
+    'Use short bullet points when helpful.',
+    'If the content is incomplete or truncated, mention that clearly.'
+  ].join(' ');
+
+  const userPrompt = `${metadataLines}\n\nContent:\n${text}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), runtime.toolSummary.timeoutMs);
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: runtime.toolSummary.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: runtime.toolSummary.maxOutputTokens,
+        temperature: 0.2
+      }),
+      signal: controller.signal
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      console.error(`[agent-runner] Tool summary failed (${response.status}): ${bodyText.slice(0, 300)}`);
+      return null;
+    }
+    const data = JSON.parse(bodyText);
+    const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text;
+    if (!content || !String(content).trim()) return null;
+    const summary = String(content).trim();
+    return `Summary:\n${summary}`;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      console.error('[agent-runner] Tool summary timed out');
+    }
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function maybeSummarizeToolResult<T>(name: string, result: T, runtime: ToolRuntime): Promise<T> {
+  if (!runtime.toolSummary.enabled) return result;
+  if (!toolSummaryMatches(name, runtime.toolSummary.tools)) return result;
+  const payload = getToolSummaryPayload(name, result);
+  if (!payload) return result;
+  const contentBytes = Buffer.byteLength(payload.text, 'utf-8');
+  if (!Number.isFinite(runtime.toolSummary.maxBytes) || contentBytes <= runtime.toolSummary.maxBytes) {
+    return result;
+  }
+  const summary = await summarizeToolOutput(payload, runtime, runtime.toolSummary.maxBytes);
+  if (!summary) return result;
+  const limited = limitText(summary, runtime.outputLimitBytes);
+  return payload.apply(limited.text) as T;
+}
+
+export function createTools(ctx: IpcContext, config: AgentRuntimeConfig['agent'], options?: { onToolCall?: ToolCallLogger; policy?: ToolPolicy }) {
+  const runtime = buildToolRuntime(config);
+  const ipc = createIpcHandlers(ctx, config.ipc);
   const isMain = ctx.isMain;
   const onToolCall = options?.onToolCall;
   const policy = options?.policy;
@@ -511,18 +842,12 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
   const defaultMax = policy?.default_max_per_run ?? 12;
   const usageCounts = new Map<string, number>();
 
-  const enableBash = isEnabled('DOTCLAW_ENABLE_BASH', true);
-  const enableWebSearch = isEnabled('DOTCLAW_ENABLE_WEBSEARCH', true);
-  const enableWebFetch = isEnabled('DOTCLAW_ENABLE_WEBFETCH', true);
-  const blockPrivate = isEnabled('DOTCLAW_WEBFETCH_BLOCK_PRIVATE', true);
-  const webFetchAllowlist = (process.env.DOTCLAW_WEBFETCH_ALLOWLIST || '')
-    .split(',')
-    .map(normalizeDomain)
-    .filter(Boolean);
-  const webFetchBlocklist = (process.env.DOTCLAW_WEBFETCH_BLOCKLIST || '')
-    .split(',')
-    .map(normalizeDomain)
-    .filter(Boolean);
+  const enableBash = runtime.enableBash;
+  const enableWebSearch = runtime.enableWebSearch;
+  const enableWebFetch = runtime.enableWebFetch;
+  const blockPrivate = runtime.webfetchBlockPrivate;
+  const webFetchAllowlist = runtime.webfetchAllowlist;
+  const webFetchBlocklist = runtime.webfetchBlocklist;
 
   const wrapExecute = <TInput, TOutput>(name: string, execute: (args: TInput) => Promise<TOutput>) => {
     return async (args: TInput): Promise<TOutput> => {
@@ -542,7 +867,8 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         }
         usageCounts.set(name, currentCount + 1);
 
-        const result = await execute(args);
+        const rawResult = await execute(args);
+        const result = await maybeSummarizeToolResult(name, rawResult, runtime);
         let outputBytes: number | undefined;
         let outputTruncated: boolean | undefined;
         try {
@@ -556,7 +882,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         }
         onToolCall?.({
           name,
-          args: sanitizeToolArgs(name, args),
+          args: sanitizeToolArgs(args),
           ok: true,
           duration_ms: Date.now() - start,
           output_bytes: outputBytes,
@@ -566,7 +892,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
       } catch (err) {
         onToolCall?.({
           name,
-          args: sanitizeToolArgs(name, args),
+          args: sanitizeToolArgs(args),
           ok: false,
           duration_ms: Date.now() - start,
           error: err instanceof Error ? err.message : String(err)
@@ -591,7 +917,38 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
       truncated: z.boolean()
     }),
     execute: wrapExecute('Bash', async ({ command, timeoutMs }: { command: string; timeoutMs?: number }) => {
-      return runCommand(command, timeoutMs || DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT);
+      return runCommand(command, timeoutMs || runtime.bashTimeoutMs, runtime.bashOutputLimitBytes);
+    })
+  });
+
+  const pythonTool = tool({
+    name: 'Python',
+    description: 'Execute Python code in a sandboxed environment. Available packages: pandas, numpy, requests, beautifulsoup4, matplotlib. CWD is /workspace/group.',
+    inputSchema: z.object({
+      code: z.string().describe('Python code to execute'),
+      timeoutMs: z.number().int().positive().optional().describe('Timeout in milliseconds (default 30000)')
+    }),
+    outputSchema: z.object({
+      stdout: z.string(),
+      stderr: z.string(),
+      exitCode: z.number().int().nullable(),
+      durationMs: z.number(),
+      truncated: z.boolean()
+    }),
+    execute: wrapExecute('Python', async ({ code, timeoutMs }: { code: string; timeoutMs?: number }) => {
+      // Write code to a temp file and execute it
+      const tempFile = `/tmp/script_${Date.now()}_${Math.random().toString(36).slice(2)}.py`;
+      fs.writeFileSync(tempFile, code);
+      try {
+        const result = await runCommand(`python3 ${tempFile}`, timeoutMs || 30000, runtime.bashOutputLimitBytes);
+        return result;
+      } finally {
+        try {
+          fs.unlinkSync(tempFile);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
     })
   });
 
@@ -626,7 +983,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         shellEscape(repo),
         shellEscape(targetPath)
       ].filter(Boolean).join(' ');
-      return runCommand(args, DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT);
+      return runCommand(args, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes);
     })
   });
 
@@ -650,7 +1007,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
       const pkgList = packages && packages.length > 0 ? packages.map(shellEscape).join(' ') : '';
       const devFlag = dev ? '--save-dev' : '';
       const command = `npm install ${devFlag} ${pkgList}`.trim();
-      return runCommand(command, DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT, cwd);
+      return runCommand(command, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes, cwd);
     })
   });
 
@@ -669,7 +1026,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     }),
     execute: wrapExecute('Read', async ({ path: inputPath, maxBytes }: { path: string; maxBytes?: number }) => {
       const resolved = resolvePath(inputPath, isMain, true);
-      const { content, truncated, size } = await readFileSafe(resolved, Math.min(maxBytes || DEFAULT_TOOL_OUTPUT_LIMIT, DEFAULT_TOOL_OUTPUT_LIMIT));
+      const { content, truncated, size } = await readFileSafe(resolved, Math.min(maxBytes || runtime.outputLimitBytes, runtime.outputLimitBytes));
       return { path: resolved, content, truncated, size };
     })
   });
@@ -824,7 +1181,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         let content: string;
         try {
           const stat = fs.statSync(file);
-          if (stat.size > DEFAULT_GREP_MAX_FILE_BYTES) continue;
+          if (stat.size > runtime.grepMaxFileBytes) continue;
           content = fs.readFileSync(file, 'utf-8');
         } catch {
           continue;
@@ -866,13 +1223,21 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         blockPrivate
       });
 
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'DotClaw/1.0',
-          'Accept': 'text/html,application/json,text/plain,*/*'
-        }
+      const response = await fetchWithRedirects({
+        url,
+        options: {
+          headers: {
+            'User-Agent': 'DotClaw/1.0',
+            'Accept': 'text/html,application/json,text/plain,*/*'
+          }
+        },
+        timeoutMs: runtime.webfetchTimeoutMs,
+        label: 'WebFetch',
+        allowlist: webFetchAllowlist,
+        blocklist: webFetchBlocklist,
+        blockPrivate
       });
-      const { body, truncated } = await readResponseWithLimit(response, maxBytes || DEFAULT_WEBFETCH_MAX_BYTES);
+      const { body, truncated } = await readResponseWithLimit(response, maxBytes || runtime.webfetchMaxBytes);
       const contentType = response.headers.get('content-type');
       let content = '';
       if (contentType && (contentType.includes('text') || contentType.includes('json'))) {
@@ -880,9 +1245,9 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
       } else {
         content = body.toString('utf-8');
       }
-      const limited = limitText(content, DEFAULT_TOOL_OUTPUT_LIMIT);
+      const limited = limitText(content, runtime.outputLimitBytes);
       return {
-        url,
+        url: response.url || url,
         status: response.status,
         contentType,
         content: limited.text,
@@ -929,12 +1294,12 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         offset: String(offset || 0),
         safesearch: safesearch || 'moderate'
       });
-      const response = await fetch(`https://api.search.brave.com/res/v1/web/search?${params.toString()}`, {
+      const response = await fetchWithTimeout(`https://api.search.brave.com/res/v1/web/search?${params.toString()}`, {
         headers: {
           'Accept': 'application/json',
           'X-Subscription-Token': apiKey
         }
-      });
+      }, runtime.websearchTimeoutMs, 'WebSearch');
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`Brave search error (${response.status}): ${text}`);
@@ -951,7 +1316,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     })
   });
 
-  const pluginTools = loadPluginConfigs().map((config) => {
+  const pluginTools = loadPluginConfigs(runtime.pluginDirs).map((config) => {
     const inputSchema = buildInputSchema(config);
     const toolName = `plugin__${config.name}`;
 
@@ -1011,11 +1376,19 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
             headers['Content-Type'] = headers['Content-Type'] || 'application/json';
           }
 
-          const response = await fetch(url, { method, headers, body });
-          const { body: responseBody, truncated } = await readResponseWithLimit(response, DEFAULT_PLUGIN_MAX_BYTES);
+          const response = await fetchWithRedirects({
+            url,
+            options: { method, headers, body },
+            timeoutMs: runtime.pluginHttpTimeoutMs,
+            label: 'Plugin HTTP',
+            allowlist: webFetchAllowlist,
+            blocklist: webFetchBlocklist,
+            blockPrivate
+          });
+          const { body: responseBody, truncated } = await readResponseWithLimit(response, runtime.pluginMaxBytes);
           const contentType = response.headers.get('content-type');
           const text = responseBody.toString('utf-8');
-          const limited = limitText(text, DEFAULT_TOOL_OUTPUT_LIMIT);
+          const limited = limitText(text, runtime.outputLimitBytes);
           return {
             status: response.status,
             contentType,
@@ -1043,7 +1416,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
             throw new Error(`Plugin ${config.name} missing command`);
           }
           const command = interpolateTemplate(config.command, args);
-          return runCommand(command, DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT);
+          return runCommand(command, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes);
         })
       });
     }
@@ -1336,7 +1709,10 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     ...pluginTools
   ];
 
-  if (enableBash) tools.push(bashTool as Tool);
+  if (enableBash) {
+    tools.push(bashTool as Tool);
+    tools.push(pythonTool as Tool);
+  }
   if (enableWebSearch) tools.push(webSearchTool as Tool);
   if (enableWebFetch) tools.push(webFetchTool as Tool);
 

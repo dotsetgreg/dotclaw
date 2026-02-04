@@ -1,6 +1,6 @@
 # DotClaw
 
-Personal OpenRouter-based assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+Personal OpenRouter-based assistant. See [README.md](README.md) for philosophy and setup. See [docs/architecture.md](docs/architecture.md) and [docs/getting-started/requirements.md](docs/getting-started/requirements.md).
 
 ## Quick Context
 
@@ -15,7 +15,7 @@ Single Node.js process that connects to Telegram, routes messages to an OpenRout
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
-| `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
+| `src/memory-store.ts` | Long-term memory storage (SQLite) |
 
 ## Skills
 

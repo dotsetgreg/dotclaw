@@ -22,3 +22,21 @@ export async function withTempCwd(tempDir, fn) {
     process.chdir(cwd);
   }
 }
+
+/**
+ * Set DOTCLAW_HOME to a temp directory and run the function.
+ * Restores the original DOTCLAW_HOME after the function completes.
+ */
+export async function withTempHome(tempDir, fn) {
+  const originalHome = process.env.DOTCLAW_HOME;
+  process.env.DOTCLAW_HOME = tempDir;
+  try {
+    return await fn();
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.DOTCLAW_HOME;
+    } else {
+      process.env.DOTCLAW_HOME = originalHome;
+    }
+  }
+}

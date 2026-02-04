@@ -1,34 +1,47 @@
 #!/usr/bin/env node
 import 'dotenv/config';
+import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { runOnce } from '@dotsetlabs/autotune';
 
+// Get DOTCLAW_HOME from environment or default to ~/.dotclaw
+const DOTCLAW_HOME = process.env.DOTCLAW_HOME || path.join(os.homedir(), '.dotclaw');
+const CONFIG_DIR = path.join(DOTCLAW_HOME, 'config');
+const DATA_DIR = path.join(DOTCLAW_HOME, 'data');
+const TRACES_DIR = path.join(DOTCLAW_HOME, 'traces');
+const PROMPTS_DIR = path.join(DOTCLAW_HOME, 'prompts');
+
 function setDefaultEnv(key, value) {
-  if (!process.env[key]) {
-    process.env[key] = value;
+  if (!process.env[key] && value !== undefined && value !== null) {
+    process.env[key] = String(value);
   }
 }
 
-function mapEnv(sourceKey, targetKey) {
-  if (process.env[sourceKey] && !process.env[targetKey]) {
-    process.env[targetKey] = process.env[sourceKey];
+function loadRuntimeConfig() {
+  const runtimePath = path.join(CONFIG_DIR, 'runtime.json');
+  if (!fs.existsSync(runtimePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(runtimePath, 'utf-8'));
+  } catch {
+    return null;
   }
 }
 
 async function main() {
-  const cwd = process.cwd();
+  const runtime = loadRuntimeConfig();
+  if (runtime) {
+    setDefaultEnv('AUTOTUNE_TRACE_DIR', runtime.host?.trace?.dir || TRACES_DIR);
+    setDefaultEnv('AUTOTUNE_OUTPUT_DIR', runtime.host?.promptPacksDir || PROMPTS_DIR);
+    setDefaultEnv('AUTOTUNE_CANARY_FRACTION', runtime.agent?.promptPacks?.canaryRate);
+  } else {
+    setDefaultEnv('AUTOTUNE_TRACE_DIR', TRACES_DIR);
+    setDefaultEnv('AUTOTUNE_OUTPUT_DIR', PROMPTS_DIR);
+  }
 
-  setDefaultEnv('AUTOTUNE_BEHAVIOR_CONFIG_PATH', path.join(cwd, 'data', 'behavior.json'));
-  setDefaultEnv('AUTOTUNE_BEHAVIOR_REPORT_DIR', path.join(cwd, 'data'));
+  setDefaultEnv('AUTOTUNE_BEHAVIOR_CONFIG_PATH', path.join(CONFIG_DIR, 'behavior.json'));
+  setDefaultEnv('AUTOTUNE_BEHAVIOR_REPORT_DIR', DATA_DIR);
   setDefaultEnv('AUTOTUNE_BEHAVIOR_ENABLED', '1');
-
-  mapEnv('DOTCLAW_AUTOTUNE_DAYS', 'AUTOTUNE_BEHAVIOR_DAYS');
-  mapEnv('DOTCLAW_AUTOTUNE_PROMPTS', 'AUTOTUNE_BEHAVIOR_PROMPT_PACKS');
-  mapEnv('DOTCLAW_AUTOTUNE_EVAL_MODEL', 'AUTOTUNE_BEHAVIOR_EVAL_MODEL');
-  mapEnv('DOTCLAW_AUTOTUNE_EVAL_SAMPLES', 'AUTOTUNE_BEHAVIOR_EVAL_SAMPLES');
-  mapEnv('DOTCLAW_TRACE_DIR', 'AUTOTUNE_TRACE_DIR');
-  mapEnv('DOTCLAW_PROMPT_PACKS_DIR', 'AUTOTUNE_OUTPUT_DIR');
-  mapEnv('DOTCLAW_PROMPT_PACKS_CANARY_RATE', 'AUTOTUNE_CANARY_FRACTION');
 
   await runOnce();
   console.log('Autotune complete.');

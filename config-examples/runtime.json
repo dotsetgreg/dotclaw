@@ -1,0 +1,30 @@
+{
+  "host": {
+    "logLevel": "info",
+    "container": {
+      "mode": "daemon"
+    },
+    "metrics": {
+      "port": 3001,
+      "enabled": true
+    },
+    "dashboard": {
+      "enabled": true
+    },
+    "memory": {
+      "embeddings": {
+        "enabled": true
+      }
+    }
+  },
+  "agent": {
+    "assistantName": "Rain",
+    "promptPacks": {
+      "enabled": true
+    },
+    "planner": {
+      "enabled": true,
+      "mode": "auto"
+    }
+  }
+}

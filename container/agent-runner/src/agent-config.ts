@@ -1,0 +1,295 @@
+import fs from 'fs';
+
+export type AgentRuntimeConfig = {
+  defaultModel: string;
+  daemonPollMs: number;
+  agent: {
+    assistantName: string;
+    openrouter: {
+      timeoutMs: number;
+      retry: boolean;
+      siteUrl: string;
+      siteName: string;
+    };
+    promptPacks: {
+      enabled: boolean;
+      maxChars: number;
+      maxDemos: number;
+      canaryRate: number;
+    };
+    context: {
+      maxContextTokens: number;
+      compactionTriggerTokens: number;
+      recentContextTokens: number;
+      summaryUpdateEveryMessages: number;
+      maxOutputTokens: number;
+      summaryMaxOutputTokens: number;
+      temperature: number;
+      maxContextMessageTokens: number;
+    };
+    memory: {
+      maxResults: number;
+      maxTokens: number;
+      extraction: {
+        enabled: boolean;
+        async: boolean;
+        maxMessages: number;
+        maxOutputTokens: number;
+      };
+      archiveSync: boolean;
+      extractScheduled: boolean;
+    };
+    models: {
+      summary: string;
+      memory: string;
+      planner: string;
+      responseValidation: string;
+      toolSummary: string;
+    };
+    planner: {
+      enabled: boolean;
+      mode: string;
+      minTokens: number;
+      triggerRegex: string;
+      maxOutputTokens: number;
+      temperature: number;
+    };
+    responseValidation: {
+      enabled: boolean;
+      maxOutputTokens: number;
+      temperature: number;
+      maxRetries: number;
+      allowToolCalls: boolean;
+    };
+    tools: {
+      maxToolSteps: number;
+      outputLimitBytes: number;
+      enableBash: boolean;
+      enableWebSearch: boolean;
+      enableWebFetch: boolean;
+      webfetch: {
+        blockPrivate: boolean;
+        allowlist: string[];
+        blocklist: string[];
+        maxBytes: number;
+        timeoutMs: number;
+      };
+      websearch: {
+        timeoutMs: number;
+      };
+      bash: {
+        timeoutMs: number;
+        outputLimitBytes: number;
+      };
+      grepMaxFileBytes: number;
+      plugin: {
+        dirs: string[];
+        maxBytes: number;
+        httpTimeoutMs: number;
+      };
+      toolSummary: {
+        enabled: boolean;
+        maxBytes: number;
+        maxOutputTokens: number;
+        tools: string[];
+      };
+    };
+    streaming: {
+      minIntervalMs: number;
+      minChars: number;
+    };
+    ipc: {
+      requestTimeoutMs: number;
+      requestPollMs: number;
+    };
+    tokenEstimate: {
+      tokensPerChar: number;
+      tokensPerMessage: number;
+      tokensPerRequest: number;
+    };
+  };
+};
+
+const CONFIG_PATH = '/workspace/config/runtime.json';
+const DEFAULT_DEFAULT_MODEL = 'moonshotai/kimi-k2.5';
+const DEFAULT_DAEMON_POLL_MS = 200;
+
+const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
+  assistantName: 'Rain',
+  openrouter: {
+    timeoutMs: 180_000,
+    retry: true,
+    siteUrl: '',
+    siteName: ''
+  },
+  promptPacks: {
+    enabled: true,
+    maxChars: 6000,
+    maxDemos: 4,
+    canaryRate: 0.1
+  },
+  context: {
+    maxContextTokens: 24_000,
+    compactionTriggerTokens: 20_000,
+    recentContextTokens: 8000,
+    summaryUpdateEveryMessages: 20,
+    maxOutputTokens: 1024,
+    summaryMaxOutputTokens: 600,
+    temperature: 0.2,
+    maxContextMessageTokens: 3000
+  },
+  memory: {
+    maxResults: 6,
+    maxTokens: 2000,
+    extraction: {
+      enabled: true,
+      async: true,
+      maxMessages: 4,
+      maxOutputTokens: 200
+    },
+    archiveSync: true,
+    extractScheduled: false
+  },
+  models: {
+    summary: 'openai/gpt-5-nano',
+    memory: 'openai/gpt-5-mini',
+    planner: 'openai/gpt-5-nano',
+    responseValidation: 'openai/gpt-5-nano',
+    toolSummary: 'openai/gpt-5-nano'
+  },
+  planner: {
+    enabled: true,
+    mode: 'auto',
+    minTokens: 600,
+    triggerRegex: '(plan|steps|roadmap|research|design|architecture|spec|strategy)',
+    maxOutputTokens: 200,
+    temperature: 0.2
+  },
+  responseValidation: {
+    enabled: true,
+    maxOutputTokens: 120,
+    temperature: 0,
+    maxRetries: 1,
+    allowToolCalls: false
+  },
+  tools: {
+    maxToolSteps: 24,
+    outputLimitBytes: 400_000,
+    enableBash: true,
+    enableWebSearch: true,
+    enableWebFetch: true,
+    webfetch: {
+      blockPrivate: true,
+      allowlist: [],
+      blocklist: ['localhost', '127.0.0.1'],
+      maxBytes: 300_000,
+      timeoutMs: 20_000
+    },
+    websearch: {
+      timeoutMs: 20_000
+    },
+    bash: {
+      timeoutMs: 120_000,
+      outputLimitBytes: 200_000
+    },
+    grepMaxFileBytes: 1_000_000,
+    plugin: {
+      dirs: [],
+      maxBytes: 800_000,
+      httpTimeoutMs: 20_000
+    },
+    toolSummary: {
+      enabled: true,
+      maxBytes: 60_000,
+      maxOutputTokens: 400,
+      tools: ['WebFetch']
+    }
+  },
+  streaming: {
+    minIntervalMs: 800,
+    minChars: 120
+  },
+  ipc: {
+    requestTimeoutMs: 6000,
+    requestPollMs: 150
+  },
+  tokenEstimate: {
+    tokensPerChar: 0.25,
+    tokensPerMessage: 3,
+    tokensPerRequest: 0
+  }
+};
+
+let cachedConfig: AgentRuntimeConfig | null = null;
+
+function cloneConfig<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function mergeDefaults<T>(base: T, overrides: unknown): T {
+  if (!isPlainObject(overrides)) return cloneConfig(base);
+  const result = cloneConfig(base) as Record<string, unknown>;
+  const baseObj = base as Record<string, unknown>;
+  for (const [key, value] of Object.entries(overrides)) {
+    const current = baseObj[key];
+    if (isPlainObject(current) && isPlainObject(value)) {
+      result[key] = mergeDefaults(current, value);
+      continue;
+    }
+    if (Array.isArray(current) && Array.isArray(value)) {
+      result[key] = value;
+      continue;
+    }
+    if (typeof value === typeof current) {
+      result[key] = value as unknown;
+    }
+  }
+  return result as T;
+}
+
+function readJson(filePath: string): unknown {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    if (!raw.trim()) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function loadAgentConfig(): AgentRuntimeConfig {
+  if (cachedConfig) return cachedConfig;
+  const raw = readJson(CONFIG_PATH);
+
+  let defaultModel = DEFAULT_DEFAULT_MODEL;
+  let daemonPollMs = DEFAULT_DAEMON_POLL_MS;
+  let agentOverrides: unknown = null;
+
+  if (isPlainObject(raw)) {
+    const host = raw.host;
+    if (isPlainObject(host)) {
+      if (typeof host.defaultModel === 'string' && host.defaultModel.trim()) {
+        defaultModel = host.defaultModel.trim();
+      }
+      const container = host.container;
+      if (isPlainObject(container) && typeof container.daemonPollMs === 'number') {
+        daemonPollMs = container.daemonPollMs;
+      }
+    }
+    if (isPlainObject(raw.agent)) {
+      agentOverrides = raw.agent;
+    }
+  }
+
+  cachedConfig = {
+    defaultModel,
+    daemonPollMs,
+    agent: mergeDefaults(DEFAULT_AGENT_CONFIG, agentOverrides)
+  };
+  return cachedConfig;
+}

@@ -4,9 +4,13 @@ node_modules/
 # Build output
 dist/
 
-# Local data & auth
-store/
+# Local runtime data
+runtime/
+groups/
+
+# Legacy runtime (unused)
 data/
+store/
 logs/
 
 # Secrets
@@ -21,3 +25,7 @@ logs/
 .vscode/
 
 agents-sdk-docs
+
+# VitePress
+docs/.vitepress/dist/
+docs/.vitepress/cache/

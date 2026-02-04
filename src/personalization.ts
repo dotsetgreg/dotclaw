@@ -1,13 +1,9 @@
 import { BehaviorConfig, ResponseStyle, loadBehaviorConfig } from './behavior-config.js';
+import { loadRuntimeConfig } from './runtime-config.js';
 import { listPreferenceMemories, PreferenceMemory } from './memory-store.js';
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-const CACHE_TTL_MS = parsePositiveInt(process.env.DOTCLAW_PERSONALIZATION_CACHE_MS, 300000);
+const runtime = loadRuntimeConfig();
+const CACHE_TTL_MS = runtime.host.memory.personalizationCacheMs;
 const cache = new Map<string, { config: BehaviorConfig; expiresAt: number }>();
 
 function pruneCache(): void {

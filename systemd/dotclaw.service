@@ -5,17 +5,18 @@ Wants=network-online.target docker.service
 
 [Service]
 Type=simple
-User=dotclaw
-WorkingDirectory=/home/dotclaw/dotclaw
+User={{USER}}
+WorkingDirectory={{DOTCLAW_HOME}}
 Environment=NODE_ENV=production
-EnvironmentFile=/home/dotclaw/dotclaw/.env
-ExecStart=/usr/bin/node /home/dotclaw/dotclaw/dist/index.js
+Environment=DOTCLAW_HOME={{DOTCLAW_HOME}}
+EnvironmentFile={{DOTCLAW_HOME}}/.env
+ExecStart={{NODE_PATH}} {{PROJECT_ROOT}}/dist/index.js
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 KillMode=process
-StandardOutput=append:/home/dotclaw/dotclaw/logs/dotclaw.log
-StandardError=append:/home/dotclaw/dotclaw/logs/dotclaw.error.log
+StandardOutput=append:{{DOTCLAW_HOME}}/logs/dotclaw.log
+StandardError=append:{{DOTCLAW_HOME}}/logs/dotclaw.error.log
 
 [Install]
 WantedBy=multi-user.target

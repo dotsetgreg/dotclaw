@@ -1,5 +1,9 @@
 import http from 'http';
 import { Registry, collectDefaultMetrics, Counter, Histogram } from 'prom-client';
+import { loadRuntimeConfig } from './runtime-config.js';
+import { logger } from './logger.js';
+
+const runtime = loadRuntimeConfig();
 
 const registry = new Registry();
 collectDefaultMetrics({ register: registry });
@@ -124,7 +128,12 @@ export function recordMemoryExtract(source: 'telegram' | 'scheduler', count: num
 }
 
 export function startMetricsServer(): void {
-  const port = parseInt(process.env.DOTCLAW_METRICS_PORT || '3001', 10);
+  if (!runtime.host.metrics.enabled) {
+    logger.info('Metrics server disabled');
+    return;
+  }
+  const port = runtime.host.metrics.port;
+  const bind = runtime.host.bind;
   const server = http.createServer(async (_req, res) => {
     try {
       const metrics = await registry.metrics();
@@ -135,7 +144,7 @@ export function startMetricsServer(): void {
       res.end('metrics error');
     }
   });
-  server.listen(port, () => {
-    console.log(`Metrics server listening on :${port}`);
+  server.listen(port, bind, () => {
+    logger.info({ port, bind }, 'Metrics server listening');
   });
 }

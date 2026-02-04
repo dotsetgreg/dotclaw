@@ -4,14 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { distPath, importFresh, withTempCwd } from './test-helpers.js';
+import { distPath, importFresh, withTempHome } from './test-helpers.js';
 
 test('loadBehaviorConfig clamps values and validates style', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-behavior-'));
-  await withTempCwd(tempDir, async () => {
-    const dataDir = path.join(tempDir, 'data');
-    fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(path.join(dataDir, 'behavior.json'), JSON.stringify({
+  await withTempHome(tempDir, async () => {
+    const configDir = path.join(tempDir, 'config');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, 'behavior.json'), JSON.stringify({
       tool_calling_bias: 5,
       memory_importance_threshold: -1,
       response_style: 'wild',
@@ -38,34 +38,18 @@ test('loadBehaviorConfig clamps values and validates style', async () => {
   });
 });
 
-test('loadBehaviorConfig honors DOTCLAW_BEHAVIOR_CONFIG_PATH override', async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-behavior-path-'));
-  await withTempCwd(tempDir, async () => {
-    const configPath = path.join(tempDir, 'custom-behavior.json');
-    fs.writeFileSync(configPath, JSON.stringify({
-      tool_calling_bias: 0.2,
-      memory_importance_threshold: 0.65,
-      response_style: 'detailed',
-      caution_bias: 0.6,
-      last_updated: '2026-02-02T12:00:00.000Z'
-    }));
+test('loadBehaviorConfig returns valid config structure', async () => {
+  const { loadBehaviorConfig } = await importFresh(distPath('behavior-config.js'));
+  const config = loadBehaviorConfig();
 
-    const prev = process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH;
-    process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH = configPath;
+  // Check that config has required fields with valid types
+  assert.ok(typeof config.tool_calling_bias === 'number', 'tool_calling_bias should be number');
+  assert.ok(typeof config.memory_importance_threshold === 'number', 'memory_importance_threshold should be number');
+  assert.ok(typeof config.caution_bias === 'number', 'caution_bias should be number');
+  assert.ok(['concise', 'balanced', 'detailed'].includes(config.response_style), 'response_style should be valid');
 
-    try {
-      const { loadBehaviorConfig } = await importFresh(distPath('behavior-config.js'));
-      const config = loadBehaviorConfig();
-      assert.equal(config.response_style, 'detailed');
-      assert.equal(config.tool_calling_bias, 0.2);
-      assert.equal(config.caution_bias, 0.6);
-      assert.equal(config.memory_importance_threshold, 0.65);
-    } finally {
-      if (prev === undefined) {
-        delete process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH;
-      } else {
-        process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH = prev;
-      }
-    }
-  });
+  // Check values are within valid ranges
+  assert.ok(config.tool_calling_bias >= 0 && config.tool_calling_bias <= 1, 'tool_calling_bias in range');
+  assert.ok(config.memory_importance_threshold >= 0 && config.memory_importance_threshold <= 1, 'memory_importance_threshold in range');
+  assert.ok(config.caution_bias >= 0 && config.caution_bias <= 1, 'caution_bias in range');
 });

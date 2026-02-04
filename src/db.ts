@@ -91,6 +91,28 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_tool_audit_trace ON tool_audit(trace_id);
     CREATE INDEX IF NOT EXISTS idx_tool_audit_group ON tool_audit(group_folder, created_at);
+
+    CREATE TABLE IF NOT EXISTS user_feedback (
+      id TEXT PRIMARY KEY,
+      trace_id TEXT NOT NULL,
+      message_id TEXT,
+      chat_jid TEXT,
+      feedback_type TEXT NOT NULL,
+      user_id TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_feedback_trace ON user_feedback(trace_id);
+    CREATE INDEX IF NOT EXISTS idx_feedback_chat ON user_feedback(chat_jid, created_at);
+
+    CREATE TABLE IF NOT EXISTS message_traces (
+      message_id TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      trace_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (message_id, chat_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_message_traces ON message_traces(trace_id);
   `);
 
   // Add sender_name column if it doesn't exist (migration for existing DBs)
@@ -120,75 +142,6 @@ export function initDatabase(): void {
 }
 
 /**
- * Store chat metadata only (no message content).
- * Used for all chats to enable group discovery without storing sensitive content.
- */
-export function storeChatMetadata(chatJid: string, timestamp: string, name?: string): void {
-  if (name) {
-    // Update with name, preserving existing timestamp if newer
-    db.prepare(`
-      INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-      ON CONFLICT(jid) DO UPDATE SET
-        name = excluded.name,
-        last_message_time = MAX(last_message_time, excluded.last_message_time)
-    `).run(chatJid, name, timestamp);
-  } else {
-    // Update timestamp only, preserve existing name if any
-    db.prepare(`
-      INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-      ON CONFLICT(jid) DO UPDATE SET
-        last_message_time = MAX(last_message_time, excluded.last_message_time)
-    `).run(chatJid, chatJid, timestamp);
-  }
-}
-
-/**
- * Update chat name without changing timestamp for existing chats.
- * New chats get the current time as their initial timestamp.
- * Used during group metadata sync.
- */
-export function updateChatName(chatJid: string, name: string): void {
-  db.prepare(`
-    INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-    ON CONFLICT(jid) DO UPDATE SET name = excluded.name
-  `).run(chatJid, name, new Date().toISOString());
-}
-
-export interface ChatInfo {
-  jid: string;
-  name: string;
-  last_message_time: string;
-}
-
-/**
- * Get all known chats, ordered by most recent activity.
- */
-export function getAllChats(): ChatInfo[] {
-  return db.prepare(`
-    SELECT jid, name, last_message_time
-    FROM chats
-    ORDER BY last_message_time DESC
-  `).all() as ChatInfo[];
-}
-
-/**
- * Get timestamp of last group metadata sync.
- */
-export function getLastGroupSync(): string | null {
-  // Store sync time in a special chat entry
-  const row = db.prepare(`SELECT last_message_time FROM chats WHERE jid = '__group_sync__'`).get() as { last_message_time: string } | undefined;
-  return row?.last_message_time || null;
-}
-
-/**
- * Record that group metadata was synced.
- */
-export function setLastGroupSync(): void {
-  const now = new Date().toISOString();
-  db.prepare(`INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES ('__group_sync__', '__group_sync__', ?)`).run(now);
-}
-
-/**
  * Store a message with full content (generic version).
  * Works with any messaging platform.
  */
@@ -203,45 +156,6 @@ export function storeMessage(
 ): void {
   db.prepare(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(msgId, chatId, senderId, senderName, content, timestamp, isFromMe ? 1 : 0);
-}
-
-export function getNewMessages(jids: string[], lastTimestamp: string): { messages: NewMessage[]; newTimestamp: string } {
-  if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
-
-  const placeholders = jids.map(() => '?').join(',');
-
-  // Filter by is_from_me - bot's messages are stored with is_from_me=1
-  // We only want messages from users (is_from_me=0)
-  const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
-    FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND is_from_me = 0
-    ORDER BY timestamp
-  `;
-  const params = [lastTimestamp, ...jids];
-
-  const rows = db.prepare(sql).all(...params) as NewMessage[];
-
-  let newTimestamp = lastTimestamp;
-  for (const row of rows) {
-    if (row.timestamp > newTimestamp) newTimestamp = row.timestamp;
-  }
-
-  return { messages: rows, newTimestamp };
-}
-
-export function getMessagesSince(chatJid: string, sinceTimestamp: string): NewMessage[] {
-  // Filter by is_from_me - bot's messages are stored with is_from_me=1
-  // We only want messages from users (is_from_me=0)
-  const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
-    FROM messages
-    WHERE chat_jid = ? AND timestamp > ? AND is_from_me = 0
-    ORDER BY timestamp
-  `;
-  const params = [chatJid, sinceTimestamp];
-
-  return db.prepare(sql).all(...params) as NewMessage[];
 }
 
 export function getMessagesSinceCursor(
@@ -297,15 +211,6 @@ export function getAllGroupSessions(): GroupSession[] {
   return db.prepare(`SELECT group_folder, session_id, updated_at FROM group_sessions`).all() as GroupSession[];
 }
 
-export function getGroupSession(groupFolder: string): GroupSession | null {
-  const row = db.prepare(`
-    SELECT group_folder, session_id, updated_at
-    FROM group_sessions
-    WHERE group_folder = ?
-  `).get(groupFolder) as GroupSession | undefined;
-  return row || null;
-}
-
 export function setGroupSession(groupFolder: string, sessionId: string): void {
   const now = new Date().toISOString();
   db.prepare(`
@@ -356,10 +261,6 @@ export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>
 
 export function getTaskById(id: string): ScheduledTask | undefined {
   return db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id) as ScheduledTask | undefined;
-}
-
-export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db.prepare('SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC').all(groupFolder) as ScheduledTask[];
 }
 
 export function getAllTasks(): ScheduledTask[] {
@@ -422,16 +323,6 @@ export function logTaskRun(log: TaskRunLog): void {
     INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(log.task_id, log.run_at, log.duration_ms, log.status, log.result, log.error);
-}
-
-export function getTaskRunLogs(taskId: string, limit = 10): TaskRunLog[] {
-  return db.prepare(`
-    SELECT task_id, run_at, duration_ms, status, result, error
-    FROM task_run_logs
-    WHERE task_id = ?
-    ORDER BY run_at DESC
-    LIMIT ?
-  `).all(taskId, limit) as TaskRunLog[];
 }
 
 export function logToolCalls(params: {
@@ -513,4 +404,110 @@ export function getToolReliability(params: {
     GROUP BY tool_name
   `).all(params.groupFolder, limit) as Array<{ tool_name: string; total: number; ok_count: number; avg_duration_ms: number | null }>;
   return rows;
+}
+
+// User feedback functions
+
+export interface UserFeedback {
+  id: string;
+  trace_id: string;
+  message_id?: string;
+  chat_jid?: string;
+  feedback_type: 'positive' | 'negative';
+  user_id?: string;
+  reason?: string;
+  created_at: string;
+}
+
+/**
+ * Link a message to its trace ID for feedback lookup
+ */
+export function linkMessageToTrace(messageId: string, chatJid: string, traceId: string): void {
+  if (!dbInitialized) initDatabase();
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT OR REPLACE INTO message_traces (message_id, chat_jid, trace_id, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(messageId, chatJid, traceId, now);
+}
+
+/**
+ * Get trace ID for a message
+ */
+export function getTraceIdForMessage(messageId: string, chatJid: string): string | null {
+  if (!dbInitialized) initDatabase();
+  const row = db.prepare(`
+    SELECT trace_id FROM message_traces
+    WHERE message_id = ? AND chat_jid = ?
+  `).get(messageId, chatJid) as { trace_id: string } | undefined;
+  return row?.trace_id ?? null;
+}
+
+/**
+ * Record user feedback (thumbs up/down reaction)
+ */
+export function recordUserFeedback(feedback: Omit<UserFeedback, 'id' | 'created_at'>): string {
+  if (!dbInitialized) initDatabase();
+  const id = `fb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO user_feedback (id, trace_id, message_id, chat_jid, feedback_type, user_id, reason, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    feedback.trace_id,
+    feedback.message_id ?? null,
+    feedback.chat_jid ?? null,
+    feedback.feedback_type,
+    feedback.user_id ?? null,
+    feedback.reason ?? null,
+    now
+  );
+  return id;
+}
+
+/**
+ * Get feedback for a trace
+ */
+export function getFeedbackForTrace(traceId: string): UserFeedback | null {
+  if (!dbInitialized) initDatabase();
+  const row = db.prepare(`
+    SELECT * FROM user_feedback
+    WHERE trace_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(traceId) as UserFeedback | undefined;
+  return row ?? null;
+}
+
+/**
+ * Get recent feedback for analytics
+ */
+export function getRecentFeedback(params: {
+  chatJid?: string;
+  limit?: number;
+  since?: string;
+}): UserFeedback[] {
+  if (!dbInitialized) initDatabase();
+  const limit = params.limit || 100;
+  const clauses: string[] = [];
+  const values: unknown[] = [];
+
+  if (params.chatJid) {
+    clauses.push('chat_jid = ?');
+    values.push(params.chatJid);
+  }
+  if (params.since) {
+    clauses.push('created_at >= ?');
+    values.push(params.since);
+  }
+
+  const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const sql = `
+    SELECT * FROM user_feedback
+    ${whereClause}
+    ORDER BY created_at DESC
+    LIMIT ?
+  `;
+  return db.prepare(sql).all(...values, limit) as UserFeedback[];
 }
