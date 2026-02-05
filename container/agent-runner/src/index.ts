@@ -97,57 +97,91 @@ function coerceTextFromContent(content: unknown): string {
 }
 
 function extractTextFallbackFromResponse(response: unknown): string {
-  if (!response || typeof response !== 'object') return '';
-  const record = response as {
-    outputText?: unknown;
-    output_text?: unknown;
-    output?: unknown;
-    choices?: unknown;
-  };
+  const seen = new Set<unknown>();
+  const maxDepth = 4;
 
-  if (typeof record.outputText === 'string' && record.outputText.trim()) {
-    return record.outputText;
-  }
-  if (typeof record.output_text === 'string' && record.output_text.trim()) {
-    return record.output_text;
-  }
+  const walk = (value: unknown, depth: number): string => {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (seen.has(value)) return '';
+    if (depth > maxDepth) return '';
+    if (Array.isArray(value)) {
+      const parts: string[] = [];
+      for (const item of value) {
+        const text = walk(item, depth + 1);
+        if (text.trim()) parts.push(text);
+      }
+      return parts.join('');
+    }
+    if (typeof value !== 'object') return '';
 
-  if (Array.isArray(record.output)) {
-    const outputTexts: string[] = [];
-    for (const item of record.output) {
-      if (!item || typeof item !== 'object') continue;
-      const typed = item as { type?: unknown; content?: unknown; text?: unknown };
-      const type = typeof typed.type === 'string' ? typed.type : '';
-      if (type === 'message') {
-        const text = coerceTextFromContent(typed.content);
-        if (text.trim()) outputTexts.push(text);
-      } else if (type === 'output_text' && typeof typed.text === 'string' && typed.text.trim()) {
-        outputTexts.push(typed.text);
+    seen.add(value);
+    const record = value as Record<string, unknown>;
+
+    if (typeof record.outputText === 'string' && record.outputText.trim()) {
+      return record.outputText;
+    }
+    if (typeof record.output_text === 'string' && record.output_text.trim()) {
+      return record.output_text;
+    }
+    if (typeof record.text === 'string' && record.text.trim()) {
+      return record.text;
+    }
+
+    if (record.message && typeof record.message === 'object') {
+      const message = record.message as { content?: unknown; text?: unknown };
+      const contentText = coerceTextFromContent(message.content ?? message.text);
+      if (contentText.trim()) return contentText;
+    }
+    if (record.content) {
+      const contentText = coerceTextFromContent(record.content);
+      if (contentText.trim()) return contentText;
+    }
+
+    if (Array.isArray(record.output)) {
+      const outputTexts: string[] = [];
+      for (const item of record.output) {
+        if (!item || typeof item !== 'object') continue;
+        const typed = item as { type?: unknown; content?: unknown; text?: unknown };
+        const type = typeof typed.type === 'string' ? typed.type : '';
+        if (type === 'message') {
+          const text = coerceTextFromContent(typed.content);
+          if (text.trim()) outputTexts.push(text);
+        } else if (type === 'output_text') {
+          const text = coerceTextFromContent(typed.text ?? typed.content);
+          if (text.trim()) outputTexts.push(text);
+        } else {
+          const text = coerceTextFromContent(typed.content ?? typed.text);
+          if (text.trim()) outputTexts.push(text);
+        }
+      }
+      const joined = outputTexts.join('');
+      if (joined.trim()) return joined;
+    }
+
+    if (Array.isArray(record.choices) && record.choices.length > 0) {
+      const choice = record.choices[0] as { message?: { content?: unknown }; text?: unknown } | null | undefined;
+      if (choice?.message) {
+        const text = coerceTextFromContent(choice.message.content);
+        if (text.trim()) return text;
+      }
+      if (typeof choice?.text === 'string' && choice.text.trim()) {
+        return choice.text;
       }
     }
-    const joined = outputTexts.join('');
-    if (joined.trim()) return joined;
-  }
 
-  if (Array.isArray(record.choices) && record.choices.length > 0) {
-    const choice = record.choices[0] as { message?: { content?: unknown }; text?: unknown } | null | undefined;
-    if (choice?.message) {
-      const text = coerceTextFromContent(choice.message.content);
+    for (const value of Object.values(record)) {
+      const text = walk(value, depth + 1);
       if (text.trim()) return text;
     }
-    if (typeof choice?.text === 'string' && choice.text.trim()) {
-      return choice.text;
-    }
-  }
 
-  return '';
+    return '';
+  };
+
+  return walk(response, 0);
 }
 
 async function getTextWithFallback(result: OpenRouterResult, context: string): Promise<string> {
-  const text = await result.getText();
-  if (text && text.trim()) {
-    return text;
-  }
   try {
     const response = await result.getResponse();
     const fallbackText = extractTextFallbackFromResponse(response);
@@ -158,6 +192,10 @@ async function getTextWithFallback(result: OpenRouterResult, context: string): P
     log(`Model returned empty response and fallback extraction failed (${context})`);
   } catch (err) {
     log(`Failed to recover empty response text (${context}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const text = await result.getText();
+  if (text && text.trim()) {
+    return text;
   }
   return text;
 }
