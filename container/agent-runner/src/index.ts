@@ -113,12 +113,20 @@ function extractTextFallbackFromResponse(response: unknown): string {
   }
 
   if (Array.isArray(record.output)) {
-    const messageItem = record.output.find(item => !!item && typeof item === 'object' && (item as { type?: unknown }).type === 'message');
-    if (messageItem && typeof messageItem === 'object') {
-      const content = (messageItem as { content?: unknown }).content;
-      const text = coerceTextFromContent(content);
-      if (text.trim()) return text;
+    const outputTexts: string[] = [];
+    for (const item of record.output) {
+      if (!item || typeof item !== 'object') continue;
+      const typed = item as { type?: unknown; content?: unknown; text?: unknown };
+      const type = typeof typed.type === 'string' ? typed.type : '';
+      if (type === 'message') {
+        const text = coerceTextFromContent(typed.content);
+        if (text.trim()) outputTexts.push(text);
+      } else if (type === 'output_text' && typeof typed.text === 'string' && typed.text.trim()) {
+        outputTexts.push(typed.text);
+      }
     }
+    const joined = outputTexts.join('');
+    if (joined.trim()) return joined;
   }
 
   if (Array.isArray(record.choices) && record.choices.length > 0) {
