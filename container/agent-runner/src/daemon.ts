@@ -72,6 +72,8 @@ function isContainerInput(value: unknown): value is ContainerInput {
 async function loop(): Promise<void> {
   ensureDirs();
   log('Daemon started');
+  const heartbeatIntervalMs = Math.max(1000, Math.min(POLL_MS, 10_000));
+  const heartbeatTimer = setInterval(writeHeartbeat, heartbeatIntervalMs);
   while (true) {
     // Write heartbeat at the start of each loop iteration
     writeHeartbeat();
@@ -83,6 +85,8 @@ async function loop(): Promise<void> {
     }
     await new Promise(resolve => setTimeout(resolve, POLL_MS));
   }
+  // Unreachable, but keep for clarity if loop ever exits
+  clearInterval(heartbeatTimer);
 }
 
 loop().catch(err => {
