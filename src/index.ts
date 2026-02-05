@@ -1059,9 +1059,8 @@ ${lines.join('\n')}
   updateChatState(msg.chatId, msg.timestamp, msg.messageId);
 
   if (output.result && output.result.trim()) {
-    let sentMessageId: string | undefined;
     const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
-    sentMessageId = sendResult.messageId;
+    const sentMessageId = sendResult.messageId;
     // Link the sent message to the trace for feedback tracking
     if (sentMessageId) {
       try {
