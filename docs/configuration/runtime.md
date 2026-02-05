@@ -116,6 +116,7 @@ title: Runtime Config
 - `host.timezone` overrides the scheduler timezone and is passed to the agent so timestamps are interpreted in the correct local time.
 - `host.heartbeat` controls automated heartbeat runs (disable if you don't want background activity).
 - `host.backgroundJobs` controls the background job queue (long-running async work).
+- `host.messageQueue.maxRetries`, `host.messageQueue.retryBaseMs`, and `host.messageQueue.retryMaxMs` control retry behavior when queued Telegram responses fail to deliver.
 - `host.routing` controls request classification, per-profile model selection, and per-profile limits.
 - `host.trace.dir` and `host.promptPacksDir` control Autotune outputs.
 - `host.memory.embeddings` configures optional embeddings for recall.

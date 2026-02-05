@@ -59,6 +59,7 @@ function buildTaskSnapshot() {
     prompt: t.prompt,
     schedule_type: t.schedule_type,
     schedule_value: t.schedule_value,
+    timezone: t.timezone ?? null,
     status: t.status,
     next_run: t.next_run,
     state_json: t.state_json ?? null,
@@ -98,6 +99,7 @@ export async function executeAgentRun(params: {
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   maxToolSteps?: number;
   timeoutMs?: number;
+  timezone?: string;
 }): Promise<{ output: ContainerOutput; context: AgentContext }> {
   const group = params.group;
   const isMain = group.folder === MAIN_GROUP_FOLDER;
@@ -149,7 +151,7 @@ export async function executeAgentRun(params: {
     modelMaxOutputTokens: Number.isFinite(resolvedMaxOutputTokens) ? resolvedMaxOutputTokens : undefined,
     modelContextTokens: context.resolvedModel.override?.context_window,
     modelTemperature: context.resolvedModel.override?.temperature,
-    timezone: TIMEZONE,
+    timezone: params.timezone || TIMEZONE,
     disablePlanner: params.disablePlanner,
     disableResponseValidation: params.disableResponseValidation,
     responseValidationMaxRetries: params.responseValidationMaxRetries,

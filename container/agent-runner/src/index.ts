@@ -40,6 +40,9 @@ const AVAILABLE_GROUPS_PATH = '/workspace/ipc/available_groups.json';
 const GROUP_CLAUDE_PATH = path.join(GROUP_DIR, 'CLAUDE.md');
 const GLOBAL_CLAUDE_PATH = path.join(GLOBAL_DIR, 'CLAUDE.md');
 const CLAUDE_NOTES_MAX_CHARS = 4000;
+const SKILL_NOTES_MAX_FILES = 16;
+const SKILL_NOTES_MAX_CHARS = 3000;
+const SKILL_NOTES_TOTAL_MAX_CHARS = 18_000;
 
 const agentConfig = loadAgentConfig();
 const agent = agentConfig.agent;
@@ -470,6 +473,7 @@ function buildSystemInstructions(params: {
   assistantName: string;
   groupNotes?: string | null;
   globalNotes?: string | null;
+  skillNotes?: SkillNote[];
   memorySummary: string;
   memoryFacts: string[];
   sessionRecall: string[];
@@ -502,7 +506,7 @@ function buildSystemInstructions(params: {
     '- `GitClone`: clone git repositories into the workspace.',
     '- `NpmInstall`: install npm dependencies in the workspace.',
     '- `mcp__dotclaw__send_message`: send Telegram messages.',
-    '- `mcp__dotclaw__schedule_task`: schedule tasks.',
+    '- `mcp__dotclaw__schedule_task`: schedule tasks (set `timezone` for locale-specific schedules).',
     '- `mcp__dotclaw__run_task`: run a scheduled task immediately.',
     '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
     '- `mcp__dotclaw__update_task`: update a task (state, prompt, schedule, status).',
@@ -552,6 +556,7 @@ function buildSystemInstructions(params: {
 
   const groupNotes = params.groupNotes ? `Group notes:\n${params.groupNotes}` : '';
   const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
+  const skillNotes = formatSkillNotes(params.skillNotes || []);
 
   const toolReliability = params.toolReliability && params.toolReliability.length > 0
     ? params.toolReliability
@@ -629,6 +634,7 @@ function buildSystemInstructions(params: {
     browserAutomation,
     groupNotes,
     globalNotes,
+    skillNotes,
     timezoneNote,
     params.planBlock || '',
     toolCallingBlock,
@@ -688,6 +694,123 @@ function loadClaudeNotes(): { group: string | null; global: string | null } {
     group: readTextFileLimited(GROUP_CLAUDE_PATH, CLAUDE_NOTES_MAX_CHARS),
     global: readTextFileLimited(GLOBAL_CLAUDE_PATH, CLAUDE_NOTES_MAX_CHARS)
   };
+}
+
+export type SkillNote = {
+  scope: 'group' | 'global';
+  path: string;
+  content: string;
+};
+
+function collectSkillFiles(rootDir: string, maxFiles: number): string[] {
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const addFile = (filePath: string) => {
+    const normalized = path.resolve(filePath);
+    if (seen.has(normalized)) return;
+    if (!fs.existsSync(normalized)) return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(normalized);
+    } catch {
+      return;
+    }
+    if (!stat.isFile()) return;
+    if (!normalized.toLowerCase().endsWith('.md')) return;
+    seen.add(normalized);
+    files.push(normalized);
+  };
+
+  addFile(path.join(rootDir, 'SKILL.md'));
+
+  const skillsDir = path.join(rootDir, 'skills');
+  if (fs.existsSync(skillsDir)) {
+    const stack = [skillsDir];
+    while (stack.length > 0 && files.length < maxFiles) {
+      const current = stack.pop();
+      if (!current) continue;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const nextPath = path.join(current, entry.name);
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isDirectory()) {
+          stack.push(nextPath);
+          continue;
+        }
+        if (entry.isFile()) {
+          addFile(nextPath);
+        }
+        if (files.length >= maxFiles) break;
+      }
+    }
+  }
+
+  files.sort((a, b) => a.localeCompare(b));
+  return files.slice(0, maxFiles);
+}
+
+export function loadSkillNotesFromRoots(params: {
+  groupDir: string;
+  globalDir: string;
+  maxFiles?: number;
+  maxCharsPerFile?: number;
+  maxTotalChars?: number;
+}): SkillNote[] {
+  const maxFiles = Number.isFinite(params.maxFiles) ? Math.max(1, Math.floor(params.maxFiles!)) : SKILL_NOTES_MAX_FILES;
+  const maxCharsPerFile = Number.isFinite(params.maxCharsPerFile)
+    ? Math.max(200, Math.floor(params.maxCharsPerFile!))
+    : SKILL_NOTES_MAX_CHARS;
+  const maxTotalChars = Number.isFinite(params.maxTotalChars)
+    ? Math.max(maxCharsPerFile, Math.floor(params.maxTotalChars!))
+    : SKILL_NOTES_TOTAL_MAX_CHARS;
+
+  const notes: SkillNote[] = [];
+  let consumedChars = 0;
+
+  const appendScopeNotes = (scope: 'group' | 'global', rootDir: string) => {
+    const skillFiles = collectSkillFiles(rootDir, maxFiles);
+    for (const filePath of skillFiles) {
+      if (notes.length >= maxFiles) break;
+      if (consumedChars >= maxTotalChars) break;
+      const content = readTextFileLimited(filePath, maxCharsPerFile);
+      if (!content) continue;
+      const remaining = maxTotalChars - consumedChars;
+      const truncated = content.length > remaining
+        ? `${content.slice(0, remaining)}\n\n[Truncated for total skill budget]`
+        : content;
+      const relativePath = path.relative(rootDir, filePath).split(path.sep).join('/');
+      notes.push({
+        scope,
+        path: relativePath || path.basename(filePath),
+        content: truncated
+      });
+      consumedChars += truncated.length;
+      if (consumedChars >= maxTotalChars) break;
+    }
+  };
+
+  appendScopeNotes('group', params.groupDir);
+  appendScopeNotes('global', params.globalDir);
+  return notes;
+}
+
+function formatSkillNotes(notes: SkillNote[]): string {
+  if (!notes || notes.length === 0) return '';
+  const lines: string[] = [
+    'Skill instructions (loaded from SKILL.md / skills/*.md):',
+    'When a task matches a skill, follow that skill workflow first and keep output concise.'
+  ];
+  for (const note of notes) {
+    lines.push(`[${note.scope}] ${note.path}`);
+    lines.push(note.content);
+  }
+  return lines.join('\n\n');
 }
 
 function extractQueryFromPrompt(prompt: string): string {
@@ -1003,6 +1126,10 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const tokenEstimate = resolveTokenEstimate(input, agentConfig);
   const availableGroups = loadAvailableGroups();
   const claudeNotes = loadClaudeNotes();
+  const skillNotes = loadSkillNotesFromRoots({
+    groupDir: GROUP_DIR,
+    globalDir: GLOBAL_DIR
+  });
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
   const toolCalls: ToolCallRecord[] = [];
@@ -1183,6 +1310,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     assistantName,
     groupNotes: claudeNotes.group,
     globalNotes: claudeNotes.global,
+    skillNotes,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
     sessionRecall,

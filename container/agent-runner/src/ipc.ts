@@ -42,6 +42,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function isValidTimezone(timezone: string): boolean {
+  if (!timezone || typeof timezone !== 'string') return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function requestResponse(
   type: string,
   payload: Record<string, unknown>,
@@ -97,12 +107,22 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       prompt: string;
       schedule_type: 'cron' | 'interval' | 'once';
       schedule_value: string;
+      timezone?: string;
       context_mode?: 'group' | 'isolated';
       target_group?: string;
     }) {
+      const timezone = typeof args.timezone === 'string' && args.timezone.trim()
+        ? args.timezone.trim()
+        : undefined;
+      if (timezone && !isValidTimezone(timezone)) {
+        return {
+          ok: false,
+          error: `Invalid timezone: "${args.timezone}". Use an IANA timezone like "America/New_York".`
+        };
+      }
       if (args.schedule_type === 'cron') {
         try {
-          CronExpressionParser.parse(args.schedule_value);
+          CronExpressionParser.parse(args.schedule_value, timezone ? { tz: timezone } : undefined);
         } catch {
           return {
             ok: false,
@@ -134,6 +154,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
         prompt: args.prompt,
         schedule_type: args.schedule_type,
         schedule_value: args.schedule_value,
+        timezone,
         context_mode: args.context_mode || 'group',
         groupFolder: targetGroup,
         chatJid,
@@ -190,7 +211,11 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       return { ok: true };
     },
 
-    async updateTask(args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) {
+    async updateTask(args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; timezone?: string; context_mode?: string; status?: string }) {
+      const timezone = typeof args.timezone === 'string' ? args.timezone.trim() : undefined;
+      if (timezone && !isValidTimezone(timezone)) {
+        return { ok: false, error: `Invalid timezone: "${args.timezone}".` };
+      }
       writeIpcFile(TASKS_DIR, {
         type: 'update_task',
         taskId: args.task_id,
@@ -198,6 +223,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
         prompt: args.prompt,
         schedule_type: args.schedule_type,
         schedule_value: args.schedule_value,
+        timezone,
         context_mode: args.context_mode,
         status: args.status,
         groupFolder,

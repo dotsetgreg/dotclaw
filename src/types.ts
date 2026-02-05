@@ -61,6 +61,7 @@ export interface ScheduledTask {
   prompt: string;
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
+  timezone?: string | null;
   context_mode: 'group' | 'isolated';
   next_run: string | null;
   last_run: string | null;
@@ -154,4 +155,5 @@ export interface QueuedMessage {
   message_thread_id: number | null;
   status: string;
   created_at: string;
+  attempt_count?: number | null;
 }

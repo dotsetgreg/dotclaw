@@ -44,6 +44,7 @@ import {
   claimBatchForChat,
   completeQueuedMessages,
   failQueuedMessages,
+  requeueQueuedMessages,
   getChatsWithPendingMessages,
   resetStalledMessages,
   resetStalledBackgroundJobs,
@@ -94,6 +95,7 @@ import { classifyBackgroundJob } from './background-job-classifier.js';
 import { routeRequest, routePrompt } from './request-router.js';
 import { probePlanner } from './planner-probe.js';
 import { generateId } from './id.js';
+import { isValidTimezone, normalizeTaskTimezone, parseScheduledTimestamp } from './timezone.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -256,6 +258,9 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
 const TELEGRAM_SEND_DELAY_MS = 250;
+const MESSAGE_QUEUE_MAX_RETRIES = Math.max(1, runtime.host.messageQueue.maxRetries ?? 4);
+const MESSAGE_QUEUE_RETRY_BASE_MS = Math.max(250, runtime.host.messageQueue.retryBaseMs ?? 3_000);
+const MESSAGE_QUEUE_RETRY_MAX_MS = Math.max(MESSAGE_QUEUE_RETRY_BASE_MS, runtime.host.messageQueue.retryMaxMs ?? 60_000);
 
 const activeDrains = new Set<string>();
 const activeRuns = new Map<string, AbortController>();
@@ -564,6 +569,32 @@ async function sendMessage(
   }
 }
 
+class RetryableMessageProcessingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RetryableMessageProcessingError';
+  }
+}
+
+function computeMessageQueueRetryDelayMs(attempt: number): number {
+  const exp = Math.max(0, attempt - 1);
+  const base = Math.min(MESSAGE_QUEUE_RETRY_MAX_MS, MESSAGE_QUEUE_RETRY_BASE_MS * Math.pow(2, exp));
+  const jitter = base * (0.8 + Math.random() * 0.4);
+  return Math.max(250, Math.round(jitter));
+}
+
+async function sendMessageForQueue(
+  chatId: string,
+  text: string,
+  options?: { messageThreadId?: number; parseMode?: string | null }
+): Promise<{ success: true; messageId?: string }> {
+  const result = await sendMessage(chatId, text, options);
+  if (!result.success) {
+    throw new RetryableMessageProcessingError('Failed to deliver Telegram message');
+  }
+  return { success: true, messageId: result.messageId };
+}
+
 interface TelegramMessage {
   chatId: string;
   messageId: string;
@@ -634,8 +665,29 @@ async function drainQueue(chatId: string): Promise<void> {
         completeQueuedMessages(batchIds);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
+        const attempt = Math.max(
+          1,
+          ...batch.map(row => {
+            const previousAttempts = Number.isFinite(row.attempt_count) ? Number(row.attempt_count) : 0;
+            return previousAttempts + 1;
+          })
+        );
+        const isRetryable = err instanceof RetryableMessageProcessingError;
+        if (isRetryable && attempt < MESSAGE_QUEUE_MAX_RETRIES) {
+          requeueQueuedMessages(batchIds, errMsg);
+          const delayMs = computeMessageQueueRetryDelayMs(attempt);
+          logger.warn({
+            chatId,
+            attempt,
+            maxRetries: MESSAGE_QUEUE_MAX_RETRIES,
+            delayMs,
+            error: errMsg
+          }, 'Retryable batch failure; re-queued for retry');
+          await sleep(delayMs);
+          continue;
+        }
         failQueuedMessages(batchIds, errMsg);
-        logger.error({ chatId, err }, 'Error processing message batch');
+        logger.error({ chatId, attempt, err }, 'Error processing message batch');
       }
     }
     if (iterations >= MAX_DRAIN_ITERATIONS) {
@@ -803,7 +855,7 @@ ${lines.join('\n')}
       ? formatPlanStepList({ steps: plannerProbeSteps, currentStep: 1, maxSteps: 4 })
       : '';
     const planLine = planPreview ? `\n\nPlanned steps:\n${planPreview}` : '';
-    await sendMessage(
+    await sendMessageForQueue(
       msg.chatId,
       `Queued this as background job ${result.jobId}. I'll report back when it's done. You can keep chatting while it runs.${queueLine}${etaLine}${detailLine}${planLine}`,
       { messageThreadId: msg.messageThreadId }
@@ -1046,7 +1098,7 @@ ${lines.join('\n')}
       }
     }
     const userMessage = humanizeError(errorMessage || 'Unknown error');
-    await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
+    await sendMessageForQueue(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
     return false;
   }
 
@@ -1072,14 +1124,14 @@ ${lines.join('\n')}
       }
     }
     const userMessage = humanizeError(errorText);
-    await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
+    await sendMessageForQueue(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
     return false;
   }
 
   updateChatState(msg.chatId, msg.timestamp, msg.messageId);
 
   if (output.result && output.result.trim()) {
-    const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
+    const sendResult = await sendMessageForQueue(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
     const sentMessageId = sendResult.messageId;
     // Link the sent message to the trace for feedback tracking
     if (sentMessageId) {
@@ -1107,14 +1159,14 @@ ${lines.join('\n')}
         return true;
       }
     }
-    await sendMessage(
+    await sendMessageForQueue(
       msg.chatId,
       'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
       { messageThreadId: msg.messageThreadId }
     );
   } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
-    await sendMessage(msg.chatId, "I wasn't able to generate a response. Please try rephrasing your message.", { messageThreadId: msg.messageThreadId });
+    await sendMessageForQueue(msg.chatId, "I wasn't able to generate a response. Please try rephrasing your message.", { messageThreadId: msg.messageThreadId });
   }
 
   if (context) {
@@ -1451,6 +1503,7 @@ async function processTaskIpc(
     prompt?: string;
     schedule_type?: string;
     schedule_value?: string;
+    timezone?: string;
     context_mode?: string;
     groupFolder?: string;
     chatJid?: string;
@@ -1493,14 +1546,23 @@ async function processTaskIpc(
         }
 
         const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
+        let taskTimezone = TIMEZONE;
+        if (typeof data.timezone === 'string' && data.timezone.trim()) {
+          const candidateTimezone = data.timezone.trim();
+          if (!isValidTimezone(candidateTimezone)) {
+            logger.warn({ timezone: data.timezone }, 'Invalid task timezone');
+            break;
+          }
+          taskTimezone = candidateTimezone;
+        }
 
         let nextRun: string | null = null;
         if (scheduleType === 'cron') {
           try {
-            const interval = CronExpressionParser.parse(data.schedule_value, { tz: TIMEZONE });
+            const interval = CronExpressionParser.parse(data.schedule_value, { tz: taskTimezone });
             nextRun = interval.next().toISOString();
           } catch {
-            logger.warn({ scheduleValue: data.schedule_value }, 'Invalid cron expression');
+            logger.warn({ scheduleValue: data.schedule_value, timezone: taskTimezone }, 'Invalid cron expression');
             break;
           }
         } else if (scheduleType === 'interval') {
@@ -1511,9 +1573,9 @@ async function processTaskIpc(
           }
           nextRun = new Date(Date.now() + ms).toISOString();
         } else if (scheduleType === 'once') {
-          const scheduled = new Date(data.schedule_value);
-          if (isNaN(scheduled.getTime())) {
-            logger.warn({ scheduleValue: data.schedule_value }, 'Invalid timestamp');
+          const scheduled = parseScheduledTimestamp(data.schedule_value, taskTimezone);
+          if (!scheduled) {
+            logger.warn({ scheduleValue: data.schedule_value, timezone: taskTimezone }, 'Invalid timestamp');
             break;
           }
           nextRun = scheduled.toISOString();
@@ -1530,12 +1592,13 @@ async function processTaskIpc(
           prompt: data.prompt,
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
+          timezone: taskTimezone,
           context_mode: contextMode,
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString()
         });
-        logger.info({ taskId, sourceGroup, targetGroup, contextMode }, 'Task created via IPC');
+        logger.info({ taskId, sourceGroup, targetGroup, contextMode, timezone: taskTimezone }, 'Task created via IPC');
       }
       break;
 
@@ -1583,23 +1646,36 @@ async function processTaskIpc(
           break;
         }
 
-        const updates: Partial<Pick<typeof task, 'prompt' | 'schedule_type' | 'schedule_value' | 'status' | 'context_mode' | 'state_json' | 'next_run'>> = {};
+        const updates: Partial<Pick<typeof task, 'prompt' | 'schedule_type' | 'schedule_value' | 'timezone' | 'status' | 'context_mode' | 'state_json' | 'next_run'>> = {};
         if (typeof data.prompt === 'string') updates.prompt = data.prompt;
         if (typeof data.context_mode === 'string') updates.context_mode = data.context_mode as typeof task.context_mode;
         if (typeof data.status === 'string') updates.status = data.status as typeof task.status;
         if (typeof data.state_json === 'string') updates.state_json = data.state_json;
+        if (typeof data.timezone === 'string') {
+          const timezoneValue = data.timezone.trim();
+          if (timezoneValue) {
+            if (!isValidTimezone(timezoneValue)) {
+              logger.warn({ timezone: data.timezone }, 'Invalid timezone for update_task');
+              break;
+            }
+            updates.timezone = timezoneValue;
+          } else {
+            updates.timezone = normalizeTaskTimezone(task.timezone, TIMEZONE);
+          }
+        }
 
         if (typeof data.schedule_type === 'string' && typeof data.schedule_value === 'string') {
           updates.schedule_type = data.schedule_type as typeof task.schedule_type;
           updates.schedule_value = data.schedule_value;
+          const taskTimezone = updates.timezone || task.timezone || TIMEZONE;
 
           let nextRun: string | null = null;
           if (updates.schedule_type === 'cron') {
             try {
-              const interval = CronExpressionParser.parse(updates.schedule_value, { tz: TIMEZONE });
+              const interval = CronExpressionParser.parse(updates.schedule_value, { tz: taskTimezone });
               nextRun = interval.next().toISOString();
             } catch {
-              logger.warn({ scheduleValue: updates.schedule_value }, 'Invalid cron expression for update_task');
+              logger.warn({ scheduleValue: updates.schedule_value, timezone: taskTimezone }, 'Invalid cron expression for update_task');
             }
           } else if (updates.schedule_type === 'interval') {
             const ms = parseInt(updates.schedule_value, 10);
@@ -1607,8 +1683,8 @@ async function processTaskIpc(
               nextRun = new Date(Date.now() + ms).toISOString();
             }
           } else if (updates.schedule_type === 'once') {
-            const scheduled = new Date(updates.schedule_value);
-            if (!isNaN(scheduled.getTime())) {
+            const scheduled = parseScheduledTimestamp(updates.schedule_value, taskTimezone);
+            if (scheduled) {
               nextRun = scheduled.toISOString();
             }
           }
@@ -1921,7 +1997,10 @@ async function processRequestIpc(
           data: typeof payload.data === 'object' && payload.data ? payload.data as Record<string, unknown> : undefined
         });
         if (result.ok && payload.notify === true && job.chat_jid) {
-          await sendMessage(job.chat_jid, `Background job ${job.id} update:\n\n${message}`);
+          const notifyResult = await sendMessage(job.chat_jid, `Background job ${job.id} update:\n\n${message}`);
+          if (!notifyResult.success) {
+            return { id: requestId, ok: false, error: 'Background job update saved, but notification delivery failed.' };
+          }
         }
         return { id: requestId, ok: result.ok, error: result.error };
       }
@@ -2398,7 +2477,7 @@ async function main(): Promise<void> {
   }
   const resetJobCount = resetStalledBackgroundJobs();
   if (resetJobCount > 0) {
-    logger.info({ count: resetJobCount }, 'Reset stalled background jobs');
+    logger.info({ count: resetJobCount }, 'Re-queued running background jobs after restart');
   }
   initMemoryStore();
   startEmbeddingWorker();
@@ -2499,7 +2578,10 @@ async function main(): Promise<void> {
     // Start scheduler and IPC watcher
     // Wrapper that matches the scheduler's expected interface (Promise<void>)
     const sendMessageForScheduler = async (jid: string, text: string): Promise<void> => {
-      await sendMessage(jid, text);
+      const result = await sendMessage(jid, text);
+      if (!result.success) {
+        throw new Error(`Failed to send message to chat ${jid}`);
+      }
     };
     startSchedulerLoop({
       sendMessage: sendMessageForScheduler,

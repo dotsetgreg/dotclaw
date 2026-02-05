@@ -59,6 +59,7 @@ export function initDatabase(): void {
       prompt TEXT NOT NULL,
       schedule_type TEXT NOT NULL,
       schedule_value TEXT NOT NULL,
+      timezone TEXT,
       next_run TEXT,
       last_run TEXT,
       last_result TEXT,
@@ -199,7 +200,8 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL,
       started_at TEXT,
       completed_at TEXT,
-      error TEXT
+      error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_mq_chat_status ON message_queue(chat_jid, status);
   `);
@@ -222,6 +224,8 @@ export function initDatabase(): void {
   addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
   addColumnIfMissing(`ALTER TABLE tool_audit ADD COLUMN user_id TEXT`);
   addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN running_since TEXT`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT`);
+  addColumnIfMissing(`ALTER TABLE message_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`);
 }
 
 /**
@@ -341,10 +345,10 @@ export function pauseTasksForGroup(groupFolder: string): number {
 export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>): void {
   db.prepare(`
     INSERT INTO scheduled_tasks (
-      id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode,
+      id, group_folder, chat_jid, prompt, schedule_type, schedule_value, timezone, context_mode,
       next_run, status, created_at, state_json, retry_count, last_error
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     task.id,
     task.group_folder,
@@ -352,6 +356,7 @@ export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>
     task.prompt,
     task.schedule_type,
     task.schedule_value,
+    task.timezone ?? null,
     task.context_mode || 'isolated',
     task.next_run,
     task.status,
@@ -370,13 +375,14 @@ export function getAllTasks(): ScheduledTask[] {
   return db.prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC').all() as ScheduledTask[];
 }
 
-export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status' | 'state_json' | 'retry_count' | 'last_error' | 'context_mode' | 'running_since'>>): void {
+export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'prompt' | 'schedule_type' | 'schedule_value' | 'timezone' | 'next_run' | 'status' | 'state_json' | 'retry_count' | 'last_error' | 'context_mode' | 'running_since'>>): void {
   const fields: string[] = [];
   const values: unknown[] = [];
 
   if (updates.prompt !== undefined) { fields.push('prompt = ?'); values.push(updates.prompt); }
   if (updates.schedule_type !== undefined) { fields.push('schedule_type = ?'); values.push(updates.schedule_type); }
   if (updates.schedule_value !== undefined) { fields.push('schedule_value = ?'); values.push(updates.schedule_value); }
+  if (updates.timezone !== undefined) { fields.push('timezone = ?'); values.push(updates.timezone); }
   if (updates.next_run !== undefined) { fields.push('next_run = ?'); values.push(updates.next_run); }
   if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
   if (updates.context_mode !== undefined) { fields.push('context_mode = ?'); values.push(updates.context_mode); }
@@ -684,9 +690,17 @@ export function failExpiredBackgroundJobs(nowIso: string): number {
 export function resetStalledBackgroundJobs(): number {
   const now = new Date().toISOString();
   const info = db.prepare(`
-    UPDATE background_jobs SET status = 'failed', last_error = 'Stale after restart', updated_at = ?
-    WHERE status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-  `).run(now, now);
+    UPDATE background_jobs
+    SET status = 'queued',
+        updated_at = ?,
+        started_at = NULL,
+        lease_expires_at = NULL,
+        last_error = CASE
+          WHEN last_error IS NULL OR last_error = '' THEN 'Recovered after restart'
+          ELSE last_error || '; recovered after restart'
+        END
+    WHERE status = 'running'
+  `).run(now);
   return info.changes;
 }
 
@@ -938,7 +952,7 @@ export function claimBatchForChat(chatJid: string, windowMs: number, maxBatchSiz
   `);
   const update = db.prepare(`
     UPDATE message_queue
-    SET status = 'processing', started_at = ?
+    SET status = 'processing', started_at = ?, attempt_count = COALESCE(attempt_count, 0) + 1
     WHERE id = ?
   `);
 
@@ -976,6 +990,24 @@ export function failQueuedMessages(ids: number[], error: string): void {
   const txn = db.transaction((idList: number[]) => {
     for (const id of idList) {
       stmt.run(now, error, id);
+    }
+  });
+  txn(ids);
+}
+
+export function requeueQueuedMessages(ids: number[], error: string): void {
+  if (ids.length === 0) return;
+  const stmt = db.prepare(`
+    UPDATE message_queue
+    SET status = 'pending',
+        started_at = NULL,
+        completed_at = NULL,
+        error = ?
+    WHERE id = ? AND status = 'processing'
+  `);
+  const txn = db.transaction((idList: number[]) => {
+    for (const id of idList) {
+      stmt.run(error, id);
     }
   });
   txn(ids);

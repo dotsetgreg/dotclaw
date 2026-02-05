@@ -61,6 +61,9 @@ export type RuntimeConfig = {
       batchWindowMs: number;
       maxBatchSize: number;
       stalledTimeoutMs: number;
+      maxRetries: number;
+      retryBaseMs: number;
+      retryMaxMs: number;
     };
     metrics: {
       port: number;
@@ -385,7 +388,10 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     messageQueue: {
       batchWindowMs: 2000,
       maxBatchSize: 50,
-      stalledTimeoutMs: 300_000
+      stalledTimeoutMs: 300_000,
+      maxRetries: 4,
+      retryBaseMs: 3_000,
+      retryMaxMs: 60_000
     },
     metrics: {
       port: 3001,

@@ -19,13 +19,73 @@ const TASK_MAX_RETRIES = runtime.host.scheduler.taskMaxRetries;
 const TASK_RETRY_BASE_MS = runtime.host.scheduler.taskRetryBaseMs;
 const TASK_RETRY_MAX_MS = runtime.host.scheduler.taskRetryMaxMs;
 const TASK_TIMEOUT_MS = runtime.host.scheduler.taskTimeoutMs;
+const TASK_NOTIFY_RETRIES = 3;
+const TASK_NOTIFY_RETRY_BASE_MS = 2_000;
+const TASK_NOTIFY_RETRY_MAX_MS = 30_000;
 
-function computeNextRun(task: ScheduledTask, error: string | null): { nextRun: string | null; retryCount: number; error: string | null } {
+function computeNotificationRetryDelayMs(attempt: number): number {
+  const exp = Math.max(0, attempt - 1);
+  const base = Math.min(TASK_NOTIFY_RETRY_MAX_MS, TASK_NOTIFY_RETRY_BASE_MS * Math.pow(2, exp));
+  const jitter = base * (0.8 + Math.random() * 0.4);
+  return Math.max(500, Math.round(jitter));
+}
+
+async function sendTaskNotification(task: ScheduledTask, message: string, deps: SchedulerDependencies): Promise<void> {
+  let lastError: string | null = null;
+  for (let attempt = 1; attempt <= TASK_NOTIFY_RETRIES; attempt += 1) {
+    try {
+      await deps.sendMessage(task.chat_jid, message);
+      return;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt >= TASK_NOTIFY_RETRIES) break;
+      const delayMs = computeNotificationRetryDelayMs(attempt);
+      logger.warn({ taskId: task.id, attempt, delayMs, error: lastError }, 'Scheduled task notification failed; retrying');
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  throw new Error(lastError || 'Unknown scheduled task notification error');
+}
+
+function summarizeTaskText(value: string | null | undefined, maxChars: number): string {
+  if (!value) return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars)}\n\n[Truncated for length]`;
+}
+
+function buildTaskNotificationMessage(params: {
+  task: ScheduledTask;
+  result: string | null;
+  error: string | null;
+  durationMs: number;
+  nextRun: string | null;
+  timezone: string;
+}): string {
+  const statusLabel = params.error ? 'failed' : 'completed';
+  const durationSeconds = Math.max(1, Math.round(params.durationMs / 1000));
+  const nextRunLine = params.nextRun
+    ? `Next run: ${params.nextRun} (${params.timezone})`
+    : 'No further runs scheduled.';
+  const body = params.error
+    ? `Error:\n${summarizeTaskText(params.error, 2000)}`
+    : `Result:\n${summarizeTaskText(params.result, 3000) || 'Completed.'}`;
+  return [
+    `Scheduled task ${params.task.id} ${statusLabel}.`,
+    `Duration: ${durationSeconds}s.`,
+    nextRunLine,
+    body
+  ].join('\n\n');
+}
+
+export function computeNextRun(task: ScheduledTask, error: string | null, nowMs: number = Date.now()): { nextRun: string | null; retryCount: number; error: string | null } {
   let scheduleNextRun: string | null = null;
   let scheduleError: string | null = null;
+  const timezone = task.timezone || TIMEZONE;
   if (task.schedule_type === 'cron') {
     try {
-      const interval = CronExpressionParser.parse(task.schedule_value, { tz: TIMEZONE });
+      const interval = CronExpressionParser.parse(task.schedule_value, { tz: timezone, currentDate: new Date(nowMs) });
       scheduleNextRun = interval.next().toISOString();
     } catch (err) {
       scheduleError = `Invalid cron expression: ${err instanceof Error ? err.message : String(err)}`;
@@ -35,7 +95,7 @@ function computeNextRun(task: ScheduledTask, error: string | null): { nextRun: s
     if (isNaN(ms) || ms <= 0) {
       scheduleError = `Invalid interval: "${task.schedule_value}"`;
     } else {
-      scheduleNextRun = new Date(Date.now() + ms).toISOString();
+      scheduleNextRun = new Date(nowMs + ms).toISOString();
     }
   }
 
@@ -50,7 +110,7 @@ function computeNextRun(task: ScheduledTask, error: string | null): { nextRun: s
       retryCount += 1;
       const baseBackoff = Math.min(TASK_RETRY_MAX_MS, TASK_RETRY_BASE_MS * Math.pow(2, retryCount - 1));
       const jitter = baseBackoff * (0.7 + Math.random() * 0.6);
-      nextRun = new Date(Date.now() + jitter).toISOString();
+      nextRun = new Date(nowMs + jitter).toISOString();
     }
   } else {
     retryCount = 0;
@@ -70,6 +130,7 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
   const startTime = Date.now();
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  const taskTimezone = task.timezone || TIMEZONE;
 
   // Scheduler loop claims tasks in DB before dispatching runTask.
   // Do not re-check/re-claim here or claimed tasks will be skipped.
@@ -98,6 +159,19 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
     });
     recordTaskRun('error');
     const { nextRun: earlyNextRun, retryCount: earlyRetryCount, error: earlyError } = computeNextRun(task, groupError);
+    try {
+      const message = buildTaskNotificationMessage({
+        task,
+        result: null,
+        error: groupError,
+        durationMs: Date.now() - startTime,
+        nextRun: earlyNextRun,
+        timezone: taskTimezone
+      });
+      await sendTaskNotification(task, message, deps);
+    } catch (notifyErr) {
+      logger.error({ taskId: task.id, err: notifyErr }, 'Failed to send scheduled task notification');
+    }
     updateTaskAfterRun(task.id, earlyNextRun, `Error: ${groupError}`, earlyError, earlyRetryCount);
     updateTask(task.id, { running_since: null });
     return;
@@ -163,7 +237,8 @@ ${task.prompt}` : task.prompt;
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
       disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
       abortSignal: abortController.signal,
-      timeoutMs: TASK_TIMEOUT_MS
+      timeoutMs: TASK_TIMEOUT_MS,
+      timezone: taskTimezone
     });
     output = execution.output;
     context = execution.context;
@@ -232,6 +307,20 @@ ${task.prompt}` : task.prompt;
 
   const { nextRun, retryCount, error: combinedError } = computeNextRun(task, error);
   if (combinedError) error = combinedError;
+
+  const notificationMessage = buildTaskNotificationMessage({
+    task,
+    result,
+    error,
+    durationMs,
+    nextRun,
+    timezone: taskTimezone
+  });
+  try {
+    await sendTaskNotification(task, notificationMessage, deps);
+  } catch (notifyErr) {
+    logger.error({ taskId: task.id, err: notifyErr }, 'Failed to send scheduled task notification');
+  }
 
   const resultSummary = error ? `Error: ${error}` : (result ? result.slice(0, 200) : 'Completed');
   updateTaskAfterRun(task.id, nextRun, resultSummary, error, retryCount);
@@ -339,7 +428,8 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
       disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
       abortSignal: abortController.signal,
-      timeoutMs: TASK_TIMEOUT_MS
+      timeoutMs: TASK_TIMEOUT_MS,
+      timezone: task.timezone || TIMEZONE
     });
     output = execution.output;
     context = execution.context;

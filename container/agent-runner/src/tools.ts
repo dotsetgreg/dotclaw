@@ -1545,6 +1545,7 @@ export function createTools(
       prompt: z.string().describe('Task prompt'),
       schedule_type: z.enum(['cron', 'interval', 'once']),
       schedule_value: z.string(),
+      timezone: z.string().optional().describe('Optional IANA timezone (e.g., America/New_York)'),
       context_mode: z.enum(['group', 'isolated']).optional(),
       target_group: z.string().optional()
     }),
@@ -1553,7 +1554,7 @@ export function createTools(
       id: z.string().optional(),
       error: z.string().optional()
     }),
-    execute: wrapExecute('mcp__dotclaw__schedule_task', async (args: { prompt: string; schedule_type: 'cron' | 'interval' | 'once'; schedule_value: string; context_mode?: 'group' | 'isolated'; target_group?: string }) =>
+    execute: wrapExecute('mcp__dotclaw__schedule_task', async (args: { prompt: string; schedule_type: 'cron' | 'interval' | 'once'; schedule_value: string; timezone?: string; context_mode?: 'group' | 'isolated'; target_group?: string }) =>
       ipc.scheduleTask(args))
   });
 
@@ -1627,6 +1628,7 @@ export function createTools(
       prompt: z.string().optional(),
       schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
       schedule_value: z.string().optional(),
+      timezone: z.string().optional(),
       context_mode: z.enum(['group', 'isolated']).optional(),
       status: z.enum(['active', 'paused', 'completed']).optional()
     }),
@@ -1634,7 +1636,7 @@ export function createTools(
       ok: z.boolean(),
       error: z.string().optional()
     }),
-    execute: wrapExecute('mcp__dotclaw__update_task', async (args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) =>
+    execute: wrapExecute('mcp__dotclaw__update_task', async (args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; timezone?: string; context_mode?: string; status?: string }) =>
       ipc.updateTask(args))
   });
 

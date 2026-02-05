@@ -5,7 +5,35 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { distPath } from './test-helpers.js';
+import { distPath, importFresh, withTempHome } from './test-helpers.js';
+
+test('computeNextRun respects task timezone for cron schedules', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-tz-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const nowMs = Date.parse('2026-02-05T12:00:00.000Z');
+    const task = {
+      id: 'task-tz',
+      group_folder: 'main',
+      chat_jid: 'chat-1',
+      prompt: 'run',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      timezone: 'America/New_York',
+      context_mode: 'group',
+      next_run: null,
+      last_run: null,
+      last_result: null,
+      status: 'active',
+      created_at: new Date(nowMs).toISOString()
+    };
+
+    const result = computeNextRun(task, null, nowMs);
+    assert.equal(result.error, null);
+    assert.equal(result.nextRun, '2026-02-05T14:00:00.000Z');
+    assert.equal(result.retryCount, 0);
+  });
+});
 
 test('scheduler loop executes claimed due tasks instead of skipping them', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-'));
@@ -25,11 +53,14 @@ test('scheduler loop executes claimed due tasks instead of skipping them', () =>
 
   const dbUrl = pathToFileURL(distPath('db.js')).href;
   const schedulerUrl = pathToFileURL(distPath('task-scheduler.js')).href;
+  const notifyLog = path.join(tempDir, 'scheduler-notify.log');
   const script = `
     import { initDatabase, createTask, getTaskById } from ${JSON.stringify(dbUrl)};
     import { startSchedulerLoop, stopSchedulerLoop } from ${JSON.stringify(schedulerUrl)};
+    import fs from 'node:fs';
 
     const taskId = 'task-scheduler-chain-test';
+    const notifyLog = ${JSON.stringify(notifyLog)};
     initDatabase();
     createTask({
       id: taskId,
@@ -45,7 +76,9 @@ test('scheduler loop executes claimed due tasks instead of skipping them', () =>
     });
 
     startSchedulerLoop({
-      sendMessage: async () => {},
+      sendMessage: async (_jid, text) => {
+        fs.appendFileSync(notifyLog, text + '\\n---\\n');
+      },
       registeredGroups: () => ({}),
       getSessions: () => ({}),
       setSession: () => {}
@@ -74,6 +107,15 @@ test('scheduler loop executes claimed due tasks instead of skipping them', () =>
     if (task.running_since) {
       console.error('running_since not cleared', task.running_since);
       process.exit(4);
+    }
+    if (!fs.existsSync(notifyLog)) {
+      console.error('notification log missing');
+      process.exit(5);
+    }
+    const sent = fs.readFileSync(notifyLog, 'utf-8');
+    if (!sent.includes('Scheduled task ' + taskId + ' failed.')) {
+      console.error('scheduler notification was not sent', sent);
+      process.exit(6);
     }
   `;
 
