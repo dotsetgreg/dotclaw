@@ -28,6 +28,8 @@ import {
 } from './memory.js';
 import { loadPromptPackWithCanary, formatTaskExtractionPack, formatResponseQualityPack, formatToolCallingPack, formatToolOutcomePack, formatMemoryPolicyPack, formatMemoryRecallPack, PromptPack } from './prompt-packs.js';
 
+type OpenRouterResult = ReturnType<OpenRouter['callModel']>;
+
 
 const SESSION_ROOT = '/workspace/session';
 const GROUP_DIR = '/workspace/group';
@@ -67,6 +69,89 @@ function getCachedOpenRouter(apiKey: string, options: ReturnType<typeof getOpenR
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function coerceTextFromContent(content: unknown): string {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (!part) return '';
+      if (typeof part === 'string') return part;
+      if (typeof part === 'object') {
+        const record = part as { text?: unknown; content?: unknown; value?: unknown };
+        if (typeof record.text === 'string') return record.text;
+        if (typeof record.content === 'string') return record.content;
+        if (typeof record.value === 'string') return record.value;
+      }
+      return '';
+    }).join('');
+  }
+  if (typeof content === 'object') {
+    const record = content as { text?: unknown; content?: unknown; value?: unknown };
+    if (typeof record.text === 'string') return record.text;
+    if (typeof record.content === 'string') return record.content;
+    if (typeof record.value === 'string') return record.value;
+  }
+  return '';
+}
+
+function extractTextFallbackFromResponse(response: unknown): string {
+  if (!response || typeof response !== 'object') return '';
+  const record = response as {
+    outputText?: unknown;
+    output_text?: unknown;
+    output?: unknown;
+    choices?: unknown;
+  };
+
+  if (typeof record.outputText === 'string' && record.outputText.trim()) {
+    return record.outputText;
+  }
+  if (typeof record.output_text === 'string' && record.output_text.trim()) {
+    return record.output_text;
+  }
+
+  if (Array.isArray(record.output)) {
+    const messageItem = record.output.find(item => !!item && typeof item === 'object' && (item as { type?: unknown }).type === 'message');
+    if (messageItem && typeof messageItem === 'object') {
+      const content = (messageItem as { content?: unknown }).content;
+      const text = coerceTextFromContent(content);
+      if (text.trim()) return text;
+    }
+  }
+
+  if (Array.isArray(record.choices) && record.choices.length > 0) {
+    const choice = record.choices[0] as { message?: { content?: unknown }; text?: unknown } | null | undefined;
+    if (choice?.message) {
+      const text = coerceTextFromContent(choice.message.content);
+      if (text.trim()) return text;
+    }
+    if (typeof choice?.text === 'string' && choice.text.trim()) {
+      return choice.text;
+    }
+  }
+
+  return '';
+}
+
+async function getTextWithFallback(result: OpenRouterResult, context: string): Promise<string> {
+  const text = await result.getText();
+  if (text && text.trim()) {
+    return text;
+  }
+  try {
+    const response = await result.getResponse();
+    const fallbackText = extractTextFallbackFromResponse(response);
+    if (fallbackText && fallbackText.trim()) {
+      log(`Recovered empty response text from payload (${context})`);
+      return fallbackText;
+    }
+    log(`Model returned empty response and fallback extraction failed (${context})`);
+  } catch (err) {
+    log(`Failed to recover empty response text (${context}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return text;
 }
 
 function writeOutput(output: ContainerOutput): void {
@@ -621,7 +706,7 @@ async function updateMemorySummary(params: {
     maxOutputTokens: params.maxOutputTokens,
     temperature: 0.1
   });
-  const text = await result.getText();
+  const text = await getTextWithFallback(result, 'summary');
   return parseSummaryResponse(text);
 }
 
@@ -762,7 +847,7 @@ async function validateResponseQuality(params: {
     maxOutputTokens: params.maxOutputTokens,
     temperature: params.temperature
   });
-  const text = await result.getText();
+  const text = await getTextWithFallback(result, 'response_validation');
   return parseResponseValidation(text);
 }
 
@@ -1134,7 +1219,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         maxOutputTokens: plannerMaxOutputTokens,
         temperature: plannerTemperature
       });
-      const plannerText = await plannerResult.getText();
+      const plannerText = await getTextWithFallback(plannerResult, 'planner');
       const plan = parsePlannerResponse(plannerText);
       if (plan) {
         planBlock = formatPlanBlock(plan);
@@ -1230,7 +1315,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       }
     }
     if (!streamed || !localResponseText || !localResponseText.trim()) {
-      localResponseText = await result.getText();
+      localResponseText = await getTextWithFallback(result, 'completion');
       if (localResponseText && localResponseText.trim()) {
         sendStreamUpdate(localResponseText, true);
       }
@@ -1373,7 +1458,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       maxOutputTokens: memoryExtractionMaxOutputTokens,
       temperature: 0.1
     });
-    const extractionText = await extractionResult.getText();
+    const extractionText = await getTextWithFallback(extractionResult, 'memory_extraction');
     const extractedItems = parseMemoryExtraction(extractionText);
     if (extractedItems.length === 0) return;
 
