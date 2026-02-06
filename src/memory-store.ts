@@ -266,7 +266,7 @@ export function initMemoryStore(): void {
     `);
     ftsEnabled = true;
   } catch (err) {
-    console.warn('[memory-store] FTS5 initialization failed, falling back to LIKE search:', err instanceof Error ? err.message : String(err));
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'FTS5 initialization failed, falling back to LIKE search');
     ftsEnabled = false;
   }
 

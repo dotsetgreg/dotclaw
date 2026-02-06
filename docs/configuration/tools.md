@@ -128,6 +128,29 @@ Telegram output tools:
 - `mcp__dotclaw__edit_message`
 - `mcp__dotclaw__delete_message`
 
+Scheduling:
+
+- `mcp__dotclaw__schedule_task`
+- `mcp__dotclaw__update_task`
+- `mcp__dotclaw__pause_task`
+- `mcp__dotclaw__resume_task`
+- `mcp__dotclaw__cancel_task`
+- `mcp__dotclaw__list_tasks`
+- `mcp__dotclaw__run_task_now`
+
+Background jobs:
+
+- `mcp__dotclaw__spawn_job`
+- `mcp__dotclaw__job_status`
+- `mcp__dotclaw__list_jobs`
+- `mcp__dotclaw__cancel_job`
+- `mcp__dotclaw__job_update`
+
+Memory:
+
+- `mcp__dotclaw__memory_upsert`
+- `mcp__dotclaw__memory_search`
+
 Utility:
 
 - `mcp__dotclaw__download_url` (enabled when WebFetch is enabled)

@@ -41,6 +41,7 @@ export interface ContainerInput {
   modelMaxOutputTokens?: number;
   modelTemperature?: number;
   timezone?: string;
+  hostPlatform?: string;
   disablePlanner?: boolean;
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
@@ -88,4 +89,6 @@ export interface ContainerOutput {
     output_truncated?: boolean;
   }>;
   latency_ms?: number;
+  /** Set by the host container-runner when stdout was truncated before parsing */
+  stdoutTruncated?: boolean;
 }

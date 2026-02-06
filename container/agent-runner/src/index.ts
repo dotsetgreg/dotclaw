@@ -489,6 +489,7 @@ function buildSystemInstructions(params: {
   isBackgroundJob: boolean;
   jobId?: string;
   timezone?: string;
+  hostPlatform?: string;
   planBlock?: string;
   taskExtractionPack?: PromptPack | null;
   responseQualityPack?: PromptPack | null;
@@ -517,7 +518,9 @@ function buildSystemInstructions(params: {
     '- `mcp__dotclaw__edit_message`: edit a previously sent message.',
     '- `mcp__dotclaw__delete_message`: delete a message.',
     '- `mcp__dotclaw__download_url`: download a URL to the workspace as a file.',
-    '- Users may send photos, documents, voice messages, and videos. These are downloaded to `/workspace/group/inbox/` and referenced as `<attachment>` tags in messages. Process them with Read/Bash/Python tools.',
+    '- To send media from the web: (1) download with `mcp__dotclaw__download_url` or `curl`/`wget` via Bash, (2) send with `mcp__dotclaw__send_photo`/`send_file`/`send_voice`/`send_audio`. This is a quick foreground task — do NOT use spawn_job for it.',
+    '- Users may send photos, documents, voice messages, and videos. These are downloaded to `/workspace/group/inbox/` and referenced as `<attachment>` tags in messages. Process them with Read/Bash/Python tools. Use ffmpeg for audio/video transcoding (e.g. voice messages must be .ogg Opus for send_voice).',
+    '- GitHub CLI (`gh`) is available. If GH_TOKEN is set, you can clone repos, create PRs, manage issues, etc. Use `gh auth status` to check authentication.',
     '- `mcp__dotclaw__schedule_task`: schedule tasks (set `timezone` for locale-specific schedules).',
     '- `mcp__dotclaw__run_task`: run a scheduled task immediately.',
     '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
@@ -525,10 +528,11 @@ function buildSystemInstructions(params: {
     '- `mcp__dotclaw__spawn_job`: start a background job.',
     '- `mcp__dotclaw__job_status`, `mcp__dotclaw__list_jobs`, `mcp__dotclaw__cancel_job`.',
     '- `mcp__dotclaw__job_update`: log job progress or notify the user.',
-    'Rule: If the task is likely to take more than ~2 minutes or needs multi-step research/coding, you MUST call `mcp__dotclaw__spawn_job` immediately and tell the user you queued it. Do not run long tasks in the foreground.',
-    '- `mcp__dotclaw__register_group`: main group only.',
-    '- `mcp__dotclaw__remove_group`, `mcp__dotclaw__list_groups`: main group only.',
-    '- `mcp__dotclaw__set_model`: main group only.',
+    'Rule: Use `mcp__dotclaw__spawn_job` ONLY for tasks that genuinely take more than ~2 minutes (cloning large repos, multi-page web research, complex coding projects). Everything else — downloading files, sending media, quick lookups, data analysis, format conversions, chart generation, scheduling reminders, web searches — should be done directly in the foreground. When in doubt, do it in the foreground.',
+    'When you DO spawn a background job, keep your reply to the user minimal — e.g. "Working on it, I\'ll send the results when done." Do not include the job ID, bullet-point plans, next steps, or status monitoring offers. The user will receive the result automatically.',
+    '- `mcp__dotclaw__register_group`: manage chat registrations.',
+    '- `mcp__dotclaw__remove_group`, `mcp__dotclaw__list_groups`: manage registered groups.',
+    '- `mcp__dotclaw__set_model`: change the active model.',
     '- `mcp__dotclaw__memory_upsert`: store durable memories.',
     '- `mcp__dotclaw__memory_search`, `mcp__dotclaw__memory_list`, `mcp__dotclaw__memory_forget`, `mcp__dotclaw__memory_stats`.',
     '- `plugin__*`: dynamically loaded plugin tools (if present and allowed by policy).'
@@ -538,6 +542,61 @@ function buildSystemInstructions(params: {
     '- Use `agent-browser open <url>` then `agent-browser snapshot -i`.',
     '- Interact with refs using `agent-browser click @e1`, `fill @e2 "text"`.',
     '- Capture evidence with `agent-browser screenshot`.'
+  ].join('\n');
+
+  const commonWorkflows = [
+    'Common workflows (do all of these in the foreground — act immediately, never spawn_job):',
+    '',
+    'Sending media from the web:',
+    '  download_url (or curl/wget) → send_photo / send_file / send_audio.',
+    '',
+    'Charts & plots:',
+    '  Python: matplotlib/pandas .plot() → plt.savefig("/workspace/group/chart.png") → send_photo.',
+    '  Graphviz: write .dot file → Bash `dot -Tpng diagram.dot -o diagram.png` → send_photo.',
+    '  Always save to a file and send — never try to "display" inline.',
+    '',
+    'Processing user attachments:',
+    '  Files arrive in /workspace/group/inbox/. The path is in the <attachment> tag.',
+    '  Spreadsheets (.xlsx/.csv): `pd.read_excel()` or `pd.read_csv()` → analyze → respond.',
+    '  JSON: Read tool or `json.load()` → analyze → respond.',
+    '  Images: Python Pillow for processing, or describe what you see if relevant.',
+    '  PDFs: Python `PyPDF2` (install at runtime if needed), or `pdftotext` via Bash.',
+    '  Archives (.zip/.tar): `unzip -l` or `tar -tf` to list, extract as needed.',
+    '  Unknown types: use `file` command to identify, then process accordingly.',
+    '',
+    'Creating & delivering files:',
+    '  When the user asks you to create a file (report, CSV, spreadsheet, script, etc.):',
+    '  Write/Python to create the file → send_file to deliver it. Do not paste large file content as a message.',
+    '  For Excel: `openpyxl` or `pd.to_excel()`. For CSV: `pd.to_csv()` or Write tool.',
+    '',
+    'Format conversions:',
+    '  Images: Python Pillow `Image.open().save("out.png")` → send_file.',
+    '  Audio/Video: `ffmpeg -i input.ext output.ext` via Bash → send_file / send_audio.',
+    '  Documents: use appropriate Python libraries or CLI tools → send_file.',
+    '',
+    'Voice messages:',
+    '  Received: arrives as .ogg in inbox. No built-in speech-to-text — acknowledge this to the user.',
+    '  Sending: create/obtain audio → `ffmpeg -i input.mp3 -c:a libopus output.ogg` → send_voice.',
+    '',
+    'Quick lookups (one tool call, immediate response):',
+    '  Time zones: `python3 -c "from datetime import datetime; from zoneinfo import ZoneInfo; ..."`',
+    '  Math/conversions: Python one-liner.',
+    '  Unit conversions, currency, percentages: Python one-liner.',
+    '',
+    'Web research:',
+    '  Simple question: WebSearch → summarize in send_message.',
+    '  Summarize a URL: WebFetch → summarize in send_message.',
+    '  Deep research (many sources): this is the one case that may warrant spawn_job.',
+    '',
+    'Reminders & scheduling:',
+    '  "Remind me at 5pm": one schedule_task call with a cron expression. Done.',
+    '  "Every Monday at 9am": one schedule_task call with cron. Done.',
+    '  Do not overthink scheduling — it is a single tool call.',
+    '',
+    'Diagrams & visualizations:',
+    '  Flowcharts/graphs: write Graphviz .dot → `dot -Tpng` → send_photo.',
+    '  Data visualizations: matplotlib/pandas → savefig → send_photo.',
+    '  Tables: use `tabulate` for markdown/ASCII tables in messages, or create an image for complex tables.'
   ].join('\n');
 
   const memorySummary = params.memorySummary ? params.memorySummary : 'None yet.';
@@ -586,31 +645,33 @@ function buildSystemInstructions(params: {
     ? String(params.behaviorConfig.response_style)
     : '';
   if (responseStyle === 'concise') {
-    behaviorNotes.push('Response style: concise and action-oriented.');
+    behaviorNotes.push('Keep responses short and to the point.');
   } else if (responseStyle === 'detailed') {
-    behaviorNotes.push('Response style: detailed and step-by-step where helpful.');
+    behaviorNotes.push('Give detailed, step-by-step responses when helpful.');
   }
   const toolBias = typeof params.behaviorConfig?.tool_calling_bias === 'number'
     ? Number(params.behaviorConfig.tool_calling_bias)
     : null;
   if (toolBias !== null && toolBias < 0.4) {
-    behaviorNotes.push('Tool usage: be conservative, ask clarifying questions before calling tools.');
+    behaviorNotes.push('Ask before using tools unless the intent is obvious.');
   } else if (toolBias !== null && toolBias > 0.6) {
-    behaviorNotes.push('Tool usage: be proactive when tools add accuracy or save time.');
+    behaviorNotes.push('Use tools proactively when they add accuracy or save time.');
   }
   const cautionBias = typeof params.behaviorConfig?.caution_bias === 'number'
     ? Number(params.behaviorConfig.caution_bias)
     : null;
   if (cautionBias !== null && cautionBias > 0.6) {
-    behaviorNotes.push('Caution: verify uncertain facts and flag limitations.');
+    behaviorNotes.push('Double-check uncertain facts and flag limitations.');
   }
-
-  const behaviorConfig = params.behaviorConfig
-    ? `Behavior overrides:\n${JSON.stringify(params.behaviorConfig, null, 2)}`
-    : '';
 
   const timezoneNote = params.timezone
     ? `Timezone: ${params.timezone}. Use this timezone when interpreting or presenting timestamps unless the user specifies another.`
+    : '';
+
+  const hostPlatformNote = params.hostPlatform
+    ? (params.hostPlatform.startsWith('linux')
+      ? `Host platform: ${params.hostPlatform} (matches container).`
+      : `You are running inside a Linux container, but the user's host machine is ${params.hostPlatform}. Packages with platform-specific native binaries (e.g. esbuild, swc, sharp) installed here won't work on the host. When you create projects with dependencies, delete node_modules before finishing and tell the user to run the install command on their machine.`)
     : '';
 
   const scheduledNote = params.isScheduledTask
@@ -620,7 +681,7 @@ function buildSystemInstructions(params: {
     ? 'You are running in the background for a user request. Focus on completing the task and return a complete response without asking follow-up questions unless strictly necessary.'
     : '';
   const jobNote = params.isBackgroundJob
-    ? `You are running as a background job${params.jobId ? ` (job id: ${params.jobId})` : ''}. Return a complete result. Do not send routine progress chatter. Only call \`mcp__dotclaw__job_update\` when the user must be notified about a blocker, a required decision, or a critical failure; otherwise rely on the final completion message. Prefer writing large outputs to the job artifacts directory.`
+    ? `You are running as a background job${params.jobId ? ` (job id: ${params.jobId})` : ''}. Complete the task silently and return the result. Do NOT call \`mcp__dotclaw__job_update\` for routine progress — only for critical blockers or required user decisions. Do NOT send messages to the chat about your progress. Just do the work and return the final result. The system will deliver your result to the user automatically.`
     : '';
   const jobArtifactsNote = params.isBackgroundJob && params.jobId
     ? `Job artifacts directory: /workspace/group/jobs/${params.jobId}`
@@ -638,12 +699,14 @@ function buildSystemInstructions(params: {
 
   return [
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
+    hostPlatformNote,
     scheduledNote,
     backgroundNote,
     jobNote,
     jobArtifactsNote,
     toolsDoc,
     browserAutomation,
+    commonWorkflows,
     groupNotes,
     globalNotes,
     skillNotes,
@@ -661,9 +724,9 @@ function buildSystemInstructions(params: {
     memoryFacts,
     'User profile (if available):',
     userProfile,
-    'Long-term memory recall (durable facts/preferences):',
+    'What you remember about the user (long-term):',
     longTermRecall,
-    'Session recall (recent/older conversation snippets):',
+    'Recent conversation context:',
     sessionRecall,
     'Memory stats:',
     memoryStats,
@@ -672,8 +735,7 @@ function buildSystemInstructions(params: {
     'Tool reliability (recent):',
     toolReliability,
     behaviorNotes.length > 0 ? `Behavior notes:\n${behaviorNotes.join('\n')}` : '',
-    behaviorConfig,
-    'Respond succinctly and helpfully. If you perform tool actions, summarize the results.'
+    'Be concise and helpful. When you use tools, summarize what happened rather than dumping raw output.'
   ].filter(Boolean).join('\n\n');
 }
 
@@ -1348,6 +1410,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     isBackgroundJob: !!input.isBackgroundJob,
     jobId: input.jobId,
     timezone: typeof input.timezone === 'string' ? input.timezone : undefined,
+    hostPlatform: typeof input.hostPlatform === 'string' ? input.hostPlatform : undefined,
     planBlock: planBlockValue,
     taskExtractionPack: taskPackResult?.pack || null,
     responseQualityPack: responseQualityResult?.pack || null,

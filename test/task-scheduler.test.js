@@ -113,7 +113,7 @@ test('scheduler loop executes claimed due tasks instead of skipping them', () =>
       process.exit(5);
     }
     const sent = fs.readFileSync(notifyLog, 'utf-8');
-    if (!sent.includes('Scheduled task ' + taskId + ' failed.')) {
+    if (!sent.includes('ran into an issue')) {
       console.error('scheduler notification was not sent', sent);
       process.exit(6);
     }
@@ -129,4 +129,107 @@ test('scheduler loop executes claimed due tasks instead of skipping them', () =>
   });
 
   assert.equal(result.status, 0, result.stderr || result.stdout || 'scheduler subprocess failed');
+});
+
+test('computeNextRun: interval schedule adds ms to now', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-interval-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const now = Date.parse('2026-02-05T12:00:00.000Z');
+    const task = {
+      schedule_type: 'interval',
+      schedule_value: '3600000',
+      timezone: 'UTC',
+      retry_count: 0
+    };
+    const result = computeNextRun(task, null, now);
+    assert.equal(result.error, null);
+    assert.equal(result.retryCount, 0);
+    assert.ok(result.nextRun);
+    assert.equal(new Date(result.nextRun).getTime(), now + 3600000);
+  });
+});
+
+test('computeNextRun: invalid cron returns error', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-badcron-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const task = {
+      schedule_type: 'cron',
+      schedule_value: 'not a cron',
+      timezone: 'UTC',
+      retry_count: 0
+    };
+    const result = computeNextRun(task, null);
+    assert.ok(result.error);
+    assert.ok(result.error.includes('Invalid cron expression'));
+  });
+});
+
+test('computeNextRun: invalid interval returns error', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-badinterval-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const task = {
+      schedule_type: 'interval',
+      schedule_value: 'abc',
+      timezone: 'UTC',
+      retry_count: 0
+    };
+    const result = computeNextRun(task, null);
+    assert.ok(result.error);
+    assert.ok(result.error.includes('Invalid interval'));
+  });
+});
+
+test('computeNextRun: negative interval returns error', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-neginterval-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const task = {
+      schedule_type: 'interval',
+      schedule_value: '-5000',
+      timezone: 'UTC',
+      retry_count: 0
+    };
+    const result = computeNextRun(task, null);
+    assert.ok(result.error);
+    assert.ok(result.error.includes('Invalid interval'));
+  });
+});
+
+test('computeNextRun: success resets retry count', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-retryreset-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const task = {
+      schedule_type: 'interval',
+      schedule_value: '60000',
+      timezone: 'UTC',
+      retry_count: 3
+    };
+    const result = computeNextRun(task, null);
+    assert.equal(result.retryCount, 0, 'retry count should reset on success');
+    assert.equal(result.error, null);
+  });
+});
+
+test('computeNextRun: error increments retry count', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-scheduler-retry-'));
+  await withTempHome(tempDir, async () => {
+    const { computeNextRun } = await importFresh(distPath('task-scheduler.js'));
+    const task = {
+      schedule_type: 'interval',
+      schedule_value: '3600000',
+      timezone: 'UTC',
+      retry_count: 0
+    };
+    const now = Date.now();
+    const result = computeNextRun(task, 'Something failed', now);
+    assert.ok(result.retryCount > 0, 'retry count should increment on error');
+    assert.ok(result.error);
+    // Retry nextRun should be sooner than the normal interval
+    const retryTime = new Date(result.nextRun).getTime();
+    assert.ok(retryTime < now + 3600000, 'retry should be sooner than normal interval');
+  });
 });

@@ -224,7 +224,8 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     const envContent = fs.readFileSync(envFile, 'utf-8');
     const secretVars = new Set([
       'OPENROUTER_API_KEY',
-      'BRAVE_SEARCH_API_KEY'
+      'BRAVE_SEARCH_API_KEY',
+      'GH_TOKEN'
     ]);
     for (const line of envContent.split('\n')) {
       const trimmed = line.trim();
@@ -529,6 +530,9 @@ export function restartDaemonContainer(group: RegisteredGroup, isMain: boolean):
 // Track daemon health check state
 let healthCheckInterval: NodeJS.Timeout | null = null;
 const unhealthyDaemons = new Map<string, number>(); // Track consecutive dead checks
+const daemonRestartTimestamps = new Map<string, number[]>(); // Track restart timestamps for crash loop detection
+const CRASH_LOOP_MAX_RESTARTS = 3;
+const CRASH_LOOP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 // Wake grace period: suppress health check kills after sleep/wake
 let wakeGraceUntil = 0;
@@ -540,6 +544,7 @@ export function suppressHealthChecks(durationMs: number): void {
 
 export function resetUnhealthyDaemons(): void {
   unhealthyDaemons.clear();
+  daemonRestartTimestamps.clear();
 }
 
 /**
@@ -603,11 +608,26 @@ export function performDaemonHealthChecks(
         daemonState: health.daemonState
       }, 'Daemon container appears dead');
 
-      // Restart after 2 consecutive dead checks
+      // Restart after 2 consecutive dead checks, unless in a crash loop
       if (consecutiveFailures >= 2) {
-        logger.info({ groupFolder: group.folder }, 'Restarting dead daemon');
-        gracefulRestartDaemonContainer(group, group.folder === mainGroupFolder);
-        unhealthyDaemons.delete(group.folder);
+        const now = Date.now();
+        const restarts = (daemonRestartTimestamps.get(group.folder) || [])
+          .filter(ts => now - ts < CRASH_LOOP_WINDOW_MS);
+
+        if (restarts.length >= CRASH_LOOP_MAX_RESTARTS) {
+          logger.error({
+            groupFolder: group.folder,
+            restartsInWindow: restarts.length,
+            windowMs: CRASH_LOOP_WINDOW_MS
+          }, 'Daemon in crash loop — not restarting. Manual intervention required.');
+          unhealthyDaemons.delete(group.folder);
+        } else {
+          restarts.push(now);
+          daemonRestartTimestamps.set(group.folder, restarts);
+          logger.info({ groupFolder: group.folder }, 'Restarting dead daemon');
+          gracefulRestartDaemonContainer(group, group.folder === mainGroupFolder);
+          unhealthyDaemons.delete(group.folder);
+        }
       }
     }
   }
@@ -973,11 +993,16 @@ export async function runContainerAgent(
           throw new Error('Container output missing required "status" field');
         }
 
+        if (stdoutTruncated) {
+          output.stdoutTruncated = true;
+        }
+
         logger.info({
           group: group.name,
           duration,
           status: output.status,
-          hasResult: !!output.result
+          hasResult: !!output.result,
+          stdoutTruncated
         }, 'Container completed');
 
         resolve(output);

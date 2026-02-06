@@ -55,6 +55,27 @@ function summarizeTaskText(value: string | null | undefined, maxChars: number): 
   return `${trimmed.slice(0, maxChars)}\n\n[Truncated for length]`;
 }
 
+function formatRelativeNextRun(isoTimestamp: string | null): string | null {
+  if (!isoTimestamp) return null;
+  try {
+    const nextDate = new Date(isoTimestamp);
+    const nowMs = Date.now();
+    const diffMs = nextDate.getTime() - nowMs;
+    if (diffMs < 0) return null;
+    const diffMinutes = Math.round(diffMs / 60_000);
+    if (diffMinutes < 2) return 'in about a minute';
+    if (diffMinutes < 60) return `in about ${diffMinutes} minutes`;
+    const diffHours = Math.round(diffMinutes / 60);
+    if (diffHours === 1) return 'in about an hour';
+    if (diffHours < 24) return `in about ${diffHours} hours`;
+    const diffDays = Math.round(diffHours / 24);
+    if (diffDays === 1) return 'tomorrow';
+    return `in ${diffDays} days`;
+  } catch {
+    return null;
+  }
+}
+
 function buildTaskNotificationMessage(params: {
   task: ScheduledTask;
   result: string | null;
@@ -62,21 +83,28 @@ function buildTaskNotificationMessage(params: {
   durationMs: number;
   nextRun: string | null;
   timezone: string;
+  retryCount?: number;
 }): string {
-  const statusLabel = params.error ? 'failed' : 'completed';
-  const durationSeconds = Math.max(1, Math.round(params.durationMs / 1000));
-  const nextRunLine = params.nextRun
-    ? `Next run: ${params.nextRun} (${params.timezone})`
-    : 'No further runs scheduled.';
+  const taskLabel = params.task.prompt.length > 60
+    ? `"${params.task.prompt.slice(0, 57)}..."`
+    : `"${params.task.prompt}"`;
+  const statusLabel = params.error ? 'ran into an issue' : 'completed';
+  const relativeNext = formatRelativeNextRun(params.nextRun);
+  const nextRunLine = relativeNext
+    ? `Next run: ${relativeNext}.`
+    : (params.nextRun ? null : 'This was a one-time task.');
+  const retryLine = params.error && typeof params.retryCount === 'number' && params.retryCount > 0
+    ? `Retrying (attempt ${params.retryCount}).`
+    : null;
   const body = params.error
-    ? `Error:\n${summarizeTaskText(params.error, 2000)}`
-    : `Result:\n${summarizeTaskText(params.result, 3000) || 'Completed.'}`;
+    ? summarizeTaskText(params.error, 2000)
+    : (summarizeTaskText(params.result, 3000) || 'Done.');
   return [
-    `Scheduled task ${params.task.id} ${statusLabel}.`,
-    `Duration: ${durationSeconds}s.`,
+    `Your task ${taskLabel} ${statusLabel}.`,
+    retryLine,
     nextRunLine,
     body
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 export function computeNextRun(task: ScheduledTask, error: string | null, nowMs: number = Date.now()): { nextRun: string | null; retryCount: number; error: string | null } {
@@ -314,7 +342,8 @@ ${task.prompt}` : task.prompt;
     error,
     durationMs,
     nextRun,
-    timezone: taskTimezone
+    timezone: taskTimezone,
+    retryCount
   });
   try {
     await sendTaskNotification(task, notificationMessage, deps);
@@ -328,6 +357,11 @@ ${task.prompt}` : task.prompt;
   // Pause if schedule itself is invalid (embedded in combinedError via scheduleError)
   if (combinedError && (combinedError.includes('Invalid cron expression') || combinedError.includes('Invalid interval'))) {
     updateTask(task.id, { status: 'paused', next_run: null });
+    try {
+      await deps.sendMessage(task.chat_jid, 'Your scheduled task has been paused because the schedule format is invalid. Please update it.');
+    } catch (pauseNotifyErr) {
+      logger.error({ taskId: task.id, err: pauseNotifyErr }, 'Failed to send task pause notification');
+    }
   }
 }
 

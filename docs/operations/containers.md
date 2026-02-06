@@ -142,4 +142,22 @@ You can inject per-group secrets (for plugin tools, API keys, etc.) in the same 
 }
 ```
 
-These values are written into the container’s `/workspace/env-dir/env` and loaded at runtime.
+These values are written into the container's `/workspace/env-dir/env` and loaded at runtime.
+
+## Daemon health monitoring
+
+In daemon mode, the container runs a worker-thread heartbeat that writes to `/workspace/ipc/heartbeat` every second, independent of the main event loop. The host checks this heartbeat periodically and classifies the daemon into one of three states:
+
+- **healthy**: heartbeat is fresh (within `heartbeatMaxAgeMs`)
+- **busy**: heartbeat is stale but the daemon is processing a request (tolerated up to the container timeout)
+- **dead**: heartbeat is stale and daemon is idle — triggers a graceful restart
+
+The daemon also writes `/workspace/ipc/daemon_status.json` with its current state (`idle` or `processing`), active request ID, and PID.
+
+### Crash loop detection
+
+If a daemon restarts more than 3 times within a 5-minute window, it is considered to be in a crash loop and will not be restarted automatically. Manual intervention is required (check logs or rebuild the container).
+
+### Graceful shutdown
+
+Daemon containers are stopped with `docker stop -t 10` (SIGTERM + 10s grace period) rather than `docker rm -f`. The daemon handles SIGTERM/SIGINT, waits up to 30 seconds for in-flight requests to complete, then exits cleanly.

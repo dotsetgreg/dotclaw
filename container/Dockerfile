@@ -1,5 +1,5 @@
 # DotClaw Agent Container
-# Runs OpenRouter-based agent runtime in isolated Linux VM with browser automation
+# Runs OpenRouter-based agent runtime in isolated container with browser automation
 
 FROM node:22-slim
 
@@ -27,13 +27,31 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
+    jq \
+    ffmpeg \
+    sqlite3 \
+    zip \
+    unzip \
+    file \
+    wget \
+    tree \
+    ripgrep \
+    graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI (not in standard Debian repos)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow the node user to install system packages via sudo
 RUN echo 'node ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/node && chmod 0440 /etc/sudoers.d/node
 
 # Install common Python packages
-RUN pip3 install --break-system-packages pandas numpy requests beautifulsoup4 matplotlib
+RUN pip3 install --break-system-packages pandas numpy requests beautifulsoup4 matplotlib Pillow openpyxl pyyaml tabulate chardet
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

@@ -463,7 +463,7 @@ function interpolateTemplate(value: string, args: Record<string, unknown>): stri
   });
 }
 
-function shellEscape(value: string): string {
+export function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -1018,7 +1018,7 @@ export function createTools(
 
   const bashTool = tool({
     name: 'Bash',
-    description: 'Run a shell command inside the container. CWD is /workspace/group.',
+    description: 'Run a shell command inside the container. Working directory is /workspace/group. Output is captured (no interactive commands). Use for ffmpeg, git, system tools, etc.',
     inputSchema: z.object({
       command: z.string().describe('Command to run'),
       timeoutMs: z.number().int().positive().optional().describe('Timeout in milliseconds')
@@ -1037,7 +1037,7 @@ export function createTools(
 
   const pythonTool = tool({
     name: 'Python',
-    description: 'Execute Python code in a sandboxed environment. Available packages: pandas, numpy, requests, beautifulsoup4, matplotlib. CWD is /workspace/group.',
+    description: 'Execute Python code. Available packages: pandas, numpy, requests, beautifulsoup4, matplotlib, Pillow, openpyxl, pyyaml, tabulate, chardet. CWD is /workspace/group. For charts: use plt.savefig() then send_photo (never plt.show()).',
     inputSchema: z.object({
       code: z.string().describe('Python code to execute'),
       timeoutMs: z.number().int().positive().optional().describe('Timeout in milliseconds (default 30000)')
@@ -1054,7 +1054,7 @@ export function createTools(
       const tempFile = path.join(WORKSPACE_GROUP, `.tmp_script_${Date.now()}_${Math.random().toString(36).slice(2)}.py`);
       fs.writeFileSync(tempFile, code);
       try {
-        const result = await runCommand(`python3 ${tempFile}`, timeoutMs || 30000, runtime.bashOutputLimitBytes);
+        const result = await runCommand(`python3 ${shellEscape(tempFile)}`, timeoutMs || 30000, runtime.bashOutputLimitBytes);
         return result;
       } finally {
         try {
@@ -1249,7 +1249,7 @@ export function createTools(
 
   const grepTool = tool({
     name: 'Grep',
-    description: 'Search for a pattern in files.',
+    description: 'Search for a text pattern in files. Returns matching lines with file paths and line numbers.',
     inputSchema: z.object({
       pattern: z.string().describe('Search pattern (plain text or regex)'),
       path: z.string().optional().describe('File or directory path (default /workspace/group)'),
@@ -1894,11 +1894,11 @@ export function createTools(
 
   const scheduleTaskTool = tool({
     name: 'mcp__dotclaw__schedule_task',
-    description: 'Schedule a recurring or one-time task.',
+    description: 'Schedule a recurring or one-time task. For cron: use 5-field expressions (min hour dom mon dow), e.g. "0 9 * * 1-5" = weekdays at 9am. For interval: milliseconds, e.g. "3600000" = every hour. For once: ISO 8601 timestamp.',
     inputSchema: z.object({
-      prompt: z.string().describe('Task prompt'),
+      prompt: z.string().describe('What the task should do when it runs'),
       schedule_type: z.enum(['cron', 'interval', 'once']),
-      schedule_value: z.string(),
+      schedule_value: z.string().describe('Cron expression, interval ms, or ISO timestamp'),
       timezone: z.string().optional().describe('Optional IANA timezone (e.g., America/New_York)'),
       context_mode: z.enum(['group', 'isolated']).optional(),
       target_group: z.string().optional()
@@ -1996,7 +1996,7 @@ export function createTools(
 
   const spawnJobTool = tool({
     name: 'mcp__dotclaw__spawn_job',
-    description: 'Start a background job that runs asynchronously and reports results later.',
+    description: 'Start a long-running background job. Use only for tasks that take >2 minutes (deep research, large code projects). Quick tasks should run in the foreground. context_mode "group" shares the workspace; "isolated" gets a clean environment.',
     inputSchema: z.object({
       prompt: z.string(),
       context_mode: z.enum(['group', 'isolated']).optional(),
@@ -2150,7 +2150,7 @@ export function createTools(
 
   const memoryUpsertTool = tool({
     name: 'mcp__dotclaw__memory_upsert',
-    description: 'Upsert long-term memory items (use for durable user or group facts/preferences).',
+    description: 'Save durable memories (user preferences, facts, project context). Use conflict_key to update existing memories instead of creating duplicates. importance 0-1 controls recall priority.',
     inputSchema: z.object({
       items: z.array(z.object({
         scope: z.enum(['user', 'group', 'global']),
@@ -2216,7 +2216,7 @@ export function createTools(
 
   const memorySearchTool = tool({
     name: 'mcp__dotclaw__memory_search',
-    description: 'Search long-term memory items.',
+    description: 'Search stored memories by natural language query. Returns the most relevant matches ranked by similarity and importance.',
     inputSchema: z.object({
       query: z.string(),
       userId: z.string().optional(),

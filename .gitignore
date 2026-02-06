@@ -8,7 +8,7 @@ dist/
 runtime/
 groups/
 
-# Legacy runtime (unused)
+# Runtime data (created at ~/.dotclaw/)
 data/
 store/
 logs/

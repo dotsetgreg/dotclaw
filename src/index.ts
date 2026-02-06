@@ -8,7 +8,7 @@ import {
   DATA_DIR,
   MAIN_GROUP_FOLDER,
   GROUPS_DIR,
-  IPC_POLL_INTERVAL,  TIMEZONE,
+  IPC_POLL_INTERVAL, TIMEZONE,
   CONTAINER_MODE,
   CONTAINER_PRIVILEGED,
   WARM_START_ENABLED,
@@ -649,7 +649,7 @@ async function downloadTelegramFile(
   fileId: string,
   groupFolder: string,
   filename: string
-): Promise<string | null> {
+): Promise<{ path: string | null; error?: 'too_large' | 'download_failed' }> {
   let localPath: string | null = null;
   let tmpPath: string | null = null;
   try {
@@ -665,13 +665,13 @@ async function downloadTelegramFile(
     }
     if (!response.ok) {
       logger.warn({ fileId, status: response.status }, 'Failed to download Telegram file');
-      return null;
+      return { path: null, error: 'download_failed' };
     }
     const contentLength = response.headers.get('content-length');
     const declaredSize = contentLength ? parseInt(contentLength, 10) : NaN;
     if (Number.isFinite(declaredSize) && declaredSize > TELEGRAM_MAX_ATTACHMENT_BYTES) {
       logger.warn({ fileId, size: contentLength }, 'Telegram file too large (>20MB)');
-      return null;
+      return { path: null, error: 'too_large' };
     }
     const inboxDir = path.join(GROUPS_DIR, groupFolder, 'inbox');
     fs.mkdirSync(inboxDir, { recursive: true });
@@ -695,7 +695,7 @@ async function downloadTelegramFile(
         bytesWritten += value.byteLength;
         if (bytesWritten > TELEGRAM_MAX_ATTACHMENT_BYTES) {
           await reader.cancel();
-          throw new Error('Telegram file exceeds 20MB size limit');
+          throw new Error('STREAMING_TOO_LARGE');
         }
         if (!fileStream.write(Buffer.from(value))) {
           await new Promise<void>(resolve => fileStream.once('drain', resolve));
@@ -715,10 +715,15 @@ async function downloadTelegramFile(
     fs.renameSync(tmpPath, localPath);
     tmpPath = null;
     logger.info({ fileId, localPath, size: bytesWritten }, 'Downloaded Telegram file');
-    return localPath;
+    return { path: localPath };
   } catch (err) {
-    logger.error({ fileId, err }, 'Error downloading Telegram file');
-    return null;
+    const isTooLarge = err instanceof Error && err.message === 'STREAMING_TOO_LARGE';
+    if (isTooLarge) {
+      logger.warn({ fileId }, 'Telegram file too large (>20MB) during streaming');
+    } else {
+      logger.error({ fileId, err }, 'Error downloading Telegram file');
+    }
+    return { path: null, error: isTooLarge ? 'too_large' : 'download_failed' };
   } finally {
     if (tmpPath && fs.existsSync(tmpPath)) {
       try {
@@ -1017,10 +1022,10 @@ function enqueueMessage(msg: TelegramMessage): void {
     if (controller) {
       controller.abort();
       activeRuns.delete(msg.chatId);
-      void sendMessage(msg.chatId, 'Canceled the current request.', { messageThreadId: msg.messageThreadId });
+      void sendMessage(msg.chatId, 'Canceled.', { messageThreadId: msg.messageThreadId });
       return;
     }
-    void sendMessage(msg.chatId, 'There is no active request to cancel.', { messageThreadId: msg.messageThreadId });
+    void sendMessage(msg.chatId, "Nothing's running right now.", { messageThreadId: msg.messageThreadId });
     return;
   }
   enqueueMessageItem({
@@ -1255,7 +1260,7 @@ ${lines.join('\n')}
 
   const maybeAutoSpawn = async (
     reason: 'timeout' | 'tool_limit' | 'classifier' | 'router' | 'planner',
-    detail?: string | null,
+    _detail?: string | null,
     overrides?: {
       modelOverride?: string;
       maxToolSteps?: number;
@@ -1301,17 +1306,18 @@ ${lines.join('\n')}
     }
 
     const queuePosition = getBackgroundJobQueuePosition({ jobId: result.jobId, groupFolder: group.folder });
-    const eta = routingDecision.estimatedMinutes ? `${routingDecision.estimatedMinutes} min` : null;
-    const detailLine = detail ? `\n\nReason: ${detail}` : '';
-    const queueLine = queuePosition ? `\n\nQueue position: ${queuePosition.position} of ${queuePosition.total}` : '';
-    const etaLine = eta ? `\n\nEstimated time: ${eta}` : '';
+    const eta = routingDecision.estimatedMinutes ? `~${routingDecision.estimatedMinutes} min` : null;
+    const queueLine = queuePosition && queuePosition.position > 1
+      ? `\n\n${queuePosition.position - 1} job${queuePosition.position > 2 ? 's' : ''} ahead of this one.`
+      : '';
+    const etaLine = eta ? `\n\nEstimated time: ${eta}.` : '';
     const planPreview = plannerProbeSteps.length > 0
       ? formatPlanStepList({ steps: plannerProbeSteps, currentStep: 1, maxSteps: 4 })
       : '';
     const planLine = planPreview ? `\n\nPlanned steps:\n${planPreview}` : '';
     await sendMessageForQueue(
       msg.chatId,
-      `Queued this as background job ${result.jobId}. I'll report back when it's done. You can keep chatting while it runs.${queueLine}${etaLine}${detailLine}${planLine}`,
+      `Working on it in the background. I'll send the result when it's done.${queueLine}${etaLine}${planLine}`,
       { messageThreadId: msg.messageThreadId, replyToMessageId }
     );
 
@@ -1600,6 +1606,13 @@ ${lines.join('\n')}
         // Don't fail if linking fails
       }
     }
+    if (output.stdoutTruncated) {
+      await sendMessageForQueue(
+        msg.chatId,
+        'That response was cut short because it was too large. Ask me to continue or try a smaller request.',
+        { messageThreadId: msg.messageThreadId }
+      );
+    }
   } else if (output.tool_calls && output.tool_calls.length > 0) {
     const toolLimitHit = !output.result || !output.result.trim() || TOOL_CALL_FALLBACK_PATTERN.test(output.result);
     if (toolLimitHit) {
@@ -1620,12 +1633,12 @@ ${lines.join('\n')}
     }
     await sendMessageForQueue(
       msg.chatId,
-      'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
+      "I ran out of steps before I could finish. Try narrowing the scope or asking for a specific part.",
       { messageThreadId: msg.messageThreadId, replyToMessageId }
     );
   } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
-    await sendMessageForQueue(msg.chatId, "I wasn't able to generate a response. Please try rephrasing your message.", { messageThreadId: msg.messageThreadId, replyToMessageId });
+    await sendMessageForQueue(msg.chatId, "I wasn't able to come up with a response. Could you try rephrasing?", { messageThreadId: msg.messageThreadId, replyToMessageId });
   }
 
   if (context) {
@@ -2656,7 +2669,7 @@ async function processRequestIpc(
             && previous.message === message
             && (nowMs - previous.at) < JOB_UPDATE_NOTIFY_DEDUP_WINDOW_MS;
           if (!isDuplicate) {
-            const notifyResult = await sendMessage(job.chat_jid, `Background job ${job.id} update:\n\n${message}`);
+            const notifyResult = await sendMessage(job.chat_jid, message);
             if (!notifyResult.success) {
               return { id: requestId, ok: false, error: 'Background job update saved, but notification delivery failed.' };
             }
@@ -3238,13 +3251,24 @@ function setupTelegramHandlers(): void {
 
     if (attachments.length > 0 && groupFolder) {
       let downloadedAny = false;
+      const failedAttachments: Array<{ name: string; error: 'too_large' | 'download_failed' }> = [];
       for (const attachment of attachments) {
         const filename = attachment.file_name || `${attachment.type}_${messageId}`;
-        const downloaded = await downloadTelegramFile(attachment.file_id, groupFolder, filename);
-        if (downloaded) {
-          attachment.local_path = downloaded;
+        const result = await downloadTelegramFile(attachment.file_id, groupFolder, filename);
+        if (result.path) {
+          attachment.local_path = result.path;
           downloadedAny = true;
+        } else if (result.error) {
+          failedAttachments.push({ name: attachment.file_name || attachment.type, error: result.error });
         }
+      }
+      if (failedAttachments.length > 0) {
+        const messages = failedAttachments.map(f =>
+          f.error === 'too_large'
+            ? `"${f.name}" is too large (over 20 MB). Try sending a smaller version.`
+            : `I couldn't download "${f.name}". Please try sending it again.`
+        );
+        void sendMessage(chatId, messages.join('\n'), { messageThreadId });
       }
       if (downloadedAny) {
         try {

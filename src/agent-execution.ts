@@ -162,6 +162,7 @@ export async function executeAgentRun(params: {
     modelContextTokens: context.resolvedModel.override?.context_window,
     modelTemperature: context.resolvedModel.override?.temperature,
     timezone: params.timezone || TIMEZONE,
+    hostPlatform: `${process.platform}/${process.arch}`,
     disablePlanner: params.disablePlanner,
     disableResponseValidation: params.disableResponseValidation,
     responseValidationMaxRetries: params.responseValidationMaxRetries,

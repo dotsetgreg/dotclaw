@@ -176,3 +176,46 @@ test('getErrorSeverity accepts Error objects', () => {
   assert.equal(getErrorSeverity(new Error('ETIMEDOUT')), 'warn');
   assert.equal(getErrorSeverity(new Error('Invalid API key')), 'error');
 });
+
+// --- payment / credit errors ---
+
+test('humanizeError converts 402 to credits message', () => {
+  const msg = humanizeError('HTTP 402 Payment Required');
+  assert.ok(msg.includes('credits'), msg);
+});
+
+test('humanizeError converts insufficient credit to credits message', () => {
+  const msg = humanizeError('Insufficient credit balance');
+  assert.ok(msg.includes('credits'), msg);
+});
+
+test('humanizeError converts payment required to credits message', () => {
+  const msg = humanizeError('payment required');
+  assert.ok(msg.includes('credits'), msg);
+});
+
+// --- container errors ---
+
+test('humanizeError converts stdout truncated', () => {
+  const msg = humanizeError('stdout truncated at 1MB');
+  assert.ok(msg.includes('too large'), msg);
+});
+
+test('humanizeError converts container exited', () => {
+  const msg = humanizeError('container exited with code 137');
+  assert.ok(msg.includes('went wrong'), msg);
+});
+
+// --- word boundary patterns ---
+
+test('humanizeError 500 word boundary does not match port 5000', () => {
+  const msg = humanizeError('listening on port 5000');
+  // Should NOT match the 500 pattern — should fall through to default
+  assert.ok(!msg.includes('server encountered'), msg);
+});
+
+test('humanizeError 502 word boundary does not match ID containing 502', () => {
+  const msg = humanizeError('response ID gen-50234 received');
+  // Should NOT match the 502 pattern
+  assert.ok(!msg.includes('temporary server'), msg);
+});

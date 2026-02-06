@@ -93,12 +93,25 @@ function formatJobCompletionMessage(params: {
   outputText?: string | null;
   outputPath?: string | null;
 }): string {
-  const statusLine = `Background job ${params.job.id} ${params.status}.`;
-  const durationLine = `Duration: ${Math.round(params.durationMs / 1000)}s.`;
-  const outputPathLine = params.outputPath ? `Output saved to: ${params.outputPath}` : '';
   const summary = params.outputText ? params.outputText.trim() : '';
-  const summaryLine = summary ? `Summary:\n${summary}` : '';
-  return [statusLine, durationLine, outputPathLine, summaryLine].filter(Boolean).join('\n\n');
+
+  // For successful jobs with a summary, just send the summary — no boilerplate
+  if (params.status === 'succeeded' && summary) {
+    return summary;
+  }
+
+  // Map internal statuses to user-friendly labels
+  const STATUS_LABELS: Record<string, string> = {
+    succeeded: 'Done',
+    failed: 'I ran into an issue while working on that',
+    timed_out: 'That task took too long and was stopped',
+    canceled: 'Canceled'
+  };
+  const statusLabel = STATUS_LABELS[params.status] || 'Done';
+  const statusLine = `${statusLabel}.`;
+  const outputPathLine = params.outputPath ? 'The full output was saved (it was too long to send here).' : '';
+  const summaryLine = summary || '';
+  return [statusLine, outputPathLine, summaryLine].filter(Boolean).join('\n\n');
 }
 
 function coerceJobPolicy(raw?: string | null): JobPolicy {
@@ -252,8 +265,8 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
           progressCount += 1;
           const elapsedMinutes = Math.max(0, Math.floor((Date.now() - startedAt) / 60_000));
           const remaining = eta ? Math.max(1, Math.ceil(eta - elapsedMinutes)) : null;
-          const etaLine = remaining ? ` ~${remaining} min remaining.` : '';
-          void deps.sendMessage(job.chat_jid, `Background job ${job.id} is still running.${etaLine}`);
+          const etaLine = remaining ? ` About ${remaining} min left.` : '';
+          void deps.sendMessage(job.chat_jid, `This is taking a while.${etaLine}`);
         };
         const startDelay = Math.max(0, JOBS_PROGRESS.startDelayMs);
         if (startDelay === 0) {
@@ -321,7 +334,7 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
   }
 
   if (!error && (!resultText || !resultText.trim())) {
-    error = 'Job returned empty result.';
+    error = 'I finished but didn\'t produce any output.';
     resultText = null;
   }
 
@@ -358,7 +371,7 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
     latestStatus: latest?.status ?? null
   });
   if (status === 'timed_out' && !error) {
-    error = `Job timed out after ${Math.round(timeoutMs / 1000)}s.`;
+    error = 'This task took too long and was stopped. Try breaking it into smaller requests.';
   }
 
   let outputPath: string | null = null;
@@ -366,7 +379,7 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
   let outputTruncated = 0;
 
   if (!outputSummary && error) {
-    outputSummary = `Error: ${error}`;
+    outputSummary = error;
   }
 
   if (latest?.status === 'canceled') {

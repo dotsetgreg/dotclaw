@@ -86,8 +86,10 @@ test('formatTelegramMessage splits long code blocks into chunks', () => {
   const longCode = '```\n' + 'x = 1\n'.repeat(500) + '```';
   const result = formatTelegramMessage(longCode, 2000);
   assert.ok(result.length > 1, 'Expected multiple chunks for long code');
+  // Chunk markers add ~30 chars overhead after packing, so allow small overshoot
+  const markerOverhead = 50;
   for (const chunk of result) {
-    assert.ok(chunk.length <= 2000, `Code chunk exceeds max length: ${chunk.length}`);
+    assert.ok(chunk.length <= 2000 + markerOverhead, `Code chunk exceeds max length + marker overhead: ${chunk.length}`);
     // Each code chunk should be properly wrapped
     if (chunk.includes('x = 1')) {
       assert.ok(chunk.includes('<pre><code>'));
@@ -136,4 +138,35 @@ test('formatTelegramMessage handles links with special characters in URL', () =>
   const result = formatTelegramMessage('[Search](https://google.com/search?q=hello&lang=en)', 4096);
   const joined = result.join('');
   assert.ok(joined.includes('href="https://google.com/search?q=hello&amp;lang=en"'));
+});
+
+// --- chunk numbering markers ---
+
+test('formatTelegramMessage adds continuation hints to multi-chunk responses', () => {
+  const longText = 'Word '.repeat(1000);
+  const result = formatTelegramMessage(longText, 2000);
+  assert.ok(result.length > 1, 'should produce multiple chunks');
+  // All but the last chunk should have a continuation hint
+  for (let i = 0; i < result.length - 1; i++) {
+    assert.ok(result[i].includes('continued'), `chunk ${i} should have continuation hint`);
+  }
+  // Last chunk should NOT have a continuation hint
+  assert.ok(!result[result.length - 1].includes('continued'), 'last chunk should not have continuation hint');
+});
+
+test('formatTelegramMessage prepends chunk markers to subsequent chunks', () => {
+  const longText = 'Word '.repeat(1000);
+  const result = formatTelegramMessage(longText, 2000);
+  assert.ok(result.length > 1);
+  // First chunk should NOT have a prepended marker (only continuation suffix)
+  assert.ok(!result[0].startsWith('[1/'));
+  // Second chunk should have a prepended marker
+  assert.ok(result[1].startsWith(`[2/${result.length}]`), 'second chunk should start with [2/N]');
+});
+
+test('formatTelegramMessage single chunk has no markers', () => {
+  const result = formatTelegramMessage('Short text', 4096);
+  assert.equal(result.length, 1);
+  assert.ok(!result[0].includes('[1/'), 'single chunk should not have markers');
+  assert.ok(!result[0].includes('continued'), 'single chunk should not have continuation hint');
 });

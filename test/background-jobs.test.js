@@ -110,3 +110,42 @@ test('resetStalledBackgroundJobs re-queues running jobs after restart', async ()
     assert.match(recovered?.last_error || '', /recovered after restart/i);
   });
 });
+
+test('resolveBackgroundJobStatus: timeout via Error with TimeoutError name', async () => {
+  const { resolveBackgroundJobStatus } = await importFresh(distPath('background-jobs.js'));
+
+  const timeoutErr = new Error('operation failed');
+  timeoutErr.name = 'TimeoutError';
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: true,
+    abortReason: timeoutErr
+  }), 'timed_out');
+});
+
+test('resolveBackgroundJobStatus: timeout via Error with timed out message', async () => {
+  const { resolveBackgroundJobStatus } = await importFresh(distPath('background-jobs.js'));
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: true,
+    abortReason: new Error('Request timed out after 30s')
+  }), 'timed_out');
+});
+
+test('resolveBackgroundJobStatus: non-timeout Error abort is canceled', async () => {
+  const { resolveBackgroundJobStatus } = await importFresh(distPath('background-jobs.js'));
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: true,
+    abortReason: new Error('user requested cancellation')
+  }), 'canceled');
+});
+
+test('resolveBackgroundJobStatus: successful with no error or abort', async () => {
+  const { resolveBackgroundJobStatus } = await importFresh(distPath('background-jobs.js'));
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: false,
+    error: null,
+    latestStatus: 'running'
+  }), 'succeeded');
+});

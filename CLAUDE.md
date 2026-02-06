@@ -13,9 +13,13 @@ Single Node.js process that connects to Telegram, routes messages to an OpenRout
 | `src/index.ts` | Main app: Telegram connection, message routing, IPC |
 | `src/config.ts` | Paths, intervals, routing defaults |
 | `src/container-runner.ts` | Spawns agent containers with mounts |
+| `src/agent-execution.ts` | Shared agent run logic (container invocation, telemetry) |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
+| `src/background-jobs.ts` | Durable background job queue |
 | `src/db.ts` | SQLite operations |
 | `src/memory-store.ts` | Long-term memory storage (SQLite) |
+| `src/error-messages.ts` | User-friendly error mapping |
+| `src/telegram-format.ts` | Markdown-to-Telegram-HTML formatter |
 
 ## Skills
 

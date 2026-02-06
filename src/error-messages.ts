@@ -29,22 +29,31 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp | string; message: string }> = [
 
   // Model errors
   { pattern: /model.?not.?found/i, message: "The AI model isn't available right now. Trying an alternative..." },
+  { pattern: /model.?not.?available/i, message: "The AI model is currently unavailable. Please try again later." },
   { pattern: /model.?unavailable/i, message: "The AI model is temporarily unavailable. Please try again later." },
   { pattern: /overloaded/i, message: "The AI service is busy right now. Please try again in a moment." },
+
+  // Payment / credit errors
+  { pattern: /402/, message: "API credits have run out. Please contact the admin." },
+  { pattern: /insufficient.?credit/i, message: "API credits have run out. Please contact the admin." },
+  { pattern: /payment.?required/i, message: "API credits have run out. Please contact the admin." },
 
   // Container errors
   { pattern: /container.?timeout/i, message: "That task took too long to complete. Please try with a smaller request." },
   { pattern: /container.?exited/i, message: "Something went wrong while processing. Let me try again." },
+  { pattern: /Invalid JSON in container output/i, message: "I ran into a technical error while processing. Please try again." },
+  { pattern: /stdout truncated/i, message: "The response was too large to deliver. Try asking for a smaller piece." },
+  { pattern: /Container output missing/i, message: "I ran into a technical error while processing. Please try again." },
 
   // Tool errors
   { pattern: /tool.?call.?limit/i, message: "I hit my limit for operations. Please narrow the scope or ask for a specific subtask." },
   { pattern: /bash.?timeout/i, message: "A command took too long to run. Please try a simpler operation." },
 
-  // Generic server errors
-  { pattern: /500/i, message: "The server encountered an error. Please try again." },
-  { pattern: /502/i, message: "There's a temporary server issue. Please try again in a moment." },
-  { pattern: /503/i, message: "The service is temporarily unavailable. Please try again later." },
-  { pattern: /504/i, message: "The request timed out. Please try again." },
+  // Generic server errors — use word boundaries to avoid matching port numbers, IDs, etc.
+  { pattern: /\b500\b/, message: "The server encountered an error. Please try again." },
+  { pattern: /\b502\b/, message: "There's a temporary server issue. Please try again in a moment." },
+  { pattern: /\b503\b/, message: "The service is temporarily unavailable. Please try again later." },
+  { pattern: /\b504\b/, message: "The request timed out. Please try again." },
 
   // Memory/resource errors
   { pattern: /out of memory/i, message: "That task needed more memory than available. Please try with less data." },

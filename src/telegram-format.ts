@@ -232,5 +232,22 @@ export function formatTelegramMessage(text: string, maxLength: number): string[]
     }
   }
 
-  return packPieces(pieces, maxLength);
+  const packed = packPieces(pieces, maxLength);
+
+  // Add chunk markers for multi-part responses so users know more is coming
+  if (packed.length > 1) {
+    for (let i = 0; i < packed.length; i++) {
+      const marker = `[${i + 1}/${packed.length}]`;
+      // Prepend marker to first line, or add as suffix for very short chunks
+      if (i > 0) {
+        packed[i] = `${marker}\n${packed[i]}`;
+      }
+      // Append continuation hint to all but the last chunk
+      if (i < packed.length - 1) {
+        packed[i] = `${packed[i]}\n<i>${marker} continued…</i>`;
+      }
+    }
+  }
+
+  return packed;
 }

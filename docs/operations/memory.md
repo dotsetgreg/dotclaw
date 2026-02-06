@@ -28,6 +28,31 @@ In the main/admin chat:
 
 You can also ask the assistant to recall or summarize what it knows.
 
+## Hybrid recall
+
+Memory recall uses a two-stage approach:
+
+1. **FTS5 keyword search**: Full-text search over memory content for fast keyword-based retrieval
+2. **Semantic embeddings** (optional): Vector similarity search using OpenAI-compatible embeddings
+
+When both signals are available, memories that appear in both keyword and semantic results are boosted in the final ranking. This hybrid approach improves recall accuracy compared to either method alone.
+
+Enable embeddings in `~/.dotclaw/config/runtime.json`:
+
+```json
+{
+  "host": {
+    "memory": {
+      "embeddings": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+The embedding worker runs in the background and processes new memory items asynchronously.
+
 ## Per-group isolation
 
 Memory items are tagged with their source group. Each group's agent only sees memory from:
