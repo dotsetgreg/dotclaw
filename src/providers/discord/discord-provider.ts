@@ -8,10 +8,12 @@ import type {
   ProviderAttachment,
   SendResult,
   SendOptions,
+  BaseOptions,
   MediaOptions,
   VoiceOptions,
   AudioOptions,
   ContactOptions,
+  PollOptions,
   ButtonRow,
 } from '../types.js';
 import { ProviderRegistry } from '../registry.js';
@@ -205,16 +207,16 @@ export class DiscordProvider implements MessagingProvider {
   }
 
   async sendPhoto(chatId: string, filePath: string, opts?: MediaOptions): Promise<SendResult> {
-    return this.sendFileAttachment(chatId, filePath, opts?.caption);
+    return this.sendFileAttachment(chatId, filePath, opts?.caption, opts);
   }
 
   async sendDocument(chatId: string, filePath: string, opts?: MediaOptions): Promise<SendResult> {
-    return this.sendFileAttachment(chatId, filePath, opts?.caption);
+    return this.sendFileAttachment(chatId, filePath, opts?.caption, opts);
   }
 
   async sendVoice(chatId: string, filePath: string, opts?: VoiceOptions): Promise<SendResult> {
     // Discord has no native voice messages; send as file attachment
-    return this.sendFileAttachment(chatId, filePath, opts?.caption);
+    return this.sendFileAttachment(chatId, filePath, opts?.caption, opts);
   }
 
   async sendAudio(chatId: string, filePath: string, opts?: AudioOptions): Promise<SendResult> {
@@ -222,21 +224,21 @@ export class DiscordProvider implements MessagingProvider {
     const caption = opts?.title
       ? `${opts.title}${opts.performer ? ` - ${opts.performer}` : ''}`
       : opts?.caption;
-    return this.sendFileAttachment(chatId, filePath, caption);
+    return this.sendFileAttachment(chatId, filePath, caption, opts);
   }
 
-  async sendLocation(chatId: string, lat: number, lng: number): Promise<SendResult> {
+  async sendLocation(chatId: string, lat: number, lng: number, opts?: BaseOptions): Promise<SendResult> {
     const text = `\u{1F4CD} Location: https://maps.google.com/?q=${lat},${lng}`;
-    return this.sendMessage(chatId, text);
+    return this.sendMessage(chatId, text, opts);
   }
 
   async sendContact(chatId: string, phone: string, name: string, opts?: ContactOptions): Promise<SendResult> {
     const fullName = opts?.lastName ? `${name} ${opts.lastName}` : name;
     const text = `\u{1F4C7} Contact: ${fullName}\n\u{1F4DE} ${phone}`;
-    return this.sendMessage(chatId, text);
+    return this.sendMessage(chatId, text, opts);
   }
 
-  async sendPoll(chatId: string, question: string, options: string[]): Promise<SendResult> {
+  async sendPoll(chatId: string, question: string, options: string[], opts?: PollOptions): Promise<SendResult> {
     // Discord's native poll API (discord.js v14.15+)
     // Fallback to text-based poll if the API is not available
     const rawChannelId = ProviderRegistry.stripPrefix(chatId);
@@ -246,15 +248,18 @@ export class DiscordProvider implements MessagingProvider {
 
       // Try native Discord polls if available
       if (this.discordJs?.PollLayoutType !== undefined) {
-        const pollData = {
+        const pollData: Record<string, unknown> = {
           poll: {
             question: { text: question },
             answers: options.map(opt => ({ text: opt })),
             duration: 24, // hours
-            allowMultiselect: false,
+            allowMultiselect: opts?.allowsMultipleAnswers ?? false,
             layoutType: this.discordJs.PollLayoutType.Default,
           },
         };
+        if (opts?.replyToMessageId) {
+          pollData.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+        }
         const sent: DiscordMessage = await channel.send(pollData);
         logger.info({ chatId: rawChannelId, question }, 'Discord poll sent');
         return { success: true, messageId: String(sent.id) };
@@ -271,7 +276,7 @@ export class DiscordProvider implements MessagingProvider {
     }
   }
 
-  async sendButtons(chatId: string, text: string, buttons: ButtonRow[]): Promise<SendResult> {
+  async sendButtons(chatId: string, text: string, buttons: ButtonRow[], opts?: BaseOptions): Promise<SendResult> {
     const rawChannelId = ProviderRegistry.stripPrefix(chatId);
     if (!this.discordJs) return { success: false };
 
@@ -297,7 +302,11 @@ export class DiscordProvider implements MessagingProvider {
         components.push(actionRow);
       }
 
-      const sent: DiscordMessage = await channel.send({ content: text, components });
+      const payload: Record<string, unknown> = { content: text, components };
+      if (opts?.replyToMessageId) {
+        payload.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
+      }
+      const sent: DiscordMessage = await channel.send(payload);
       logger.info({ chatId: rawChannelId }, 'Discord buttons sent');
       return { success: true, messageId: String(sent.id) };
     } catch (err) {
@@ -469,7 +478,8 @@ export class DiscordProvider implements MessagingProvider {
   private async sendFileAttachment(
     chatId: string,
     filePath: string,
-    caption?: string
+    caption?: string,
+    opts?: BaseOptions
   ): Promise<SendResult> {
     const rawChannelId = ProviderRegistry.stripPrefix(chatId);
     for (let attempt = 1; attempt <= this.config.sendRetries; attempt += 1) {
@@ -481,6 +491,9 @@ export class DiscordProvider implements MessagingProvider {
         };
         if (caption) {
           payload.content = caption;
+        }
+        if (opts?.replyToMessageId) {
+          payload.reply = { messageReference: opts.replyToMessageId, failIfNotExists: false };
         }
         const sent: DiscordMessage = await channel.send(payload);
         logger.info({ chatId: rawChannelId, filePath }, 'Discord file sent');

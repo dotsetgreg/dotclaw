@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { OpenRouter, stepCountIs } from '@openrouter/sdk';
-import { createTools, ToolCallRecord } from './tools.js';
+import { createTools, discoverMcpTools, ToolCallRecord } from './tools.js';
 import { createIpcHandlers } from './ipc.js';
 import { loadAgentConfig } from './agent-config.js';
 import { OUTPUT_START_MARKER, OUTPUT_END_MARKER, type ContainerInput, type ContainerOutput } from './container-protocol.js';
@@ -909,7 +909,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const claudeNotes = loadClaudeNotes();
   const skillCatalog = buildSkillCatalog({
     groupDir: GROUP_DIR,
-    globalDir: GLOBAL_DIR
+    globalDir: GLOBAL_DIR,
+    maxSkills: agent.skills.maxSkills
   });
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
@@ -941,7 +942,6 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   let mcpCleanup: (() => Promise<void>) | null = null;
   if (agent.mcp.enabled && agent.mcp.servers.length > 0) {
     try {
-      const { discoverMcpTools } = await import('./tools.js');
       // Build a minimal wrapExecute for MCP tools (policy + logging handled by createTools wrapExecute pattern)
       const wrapMcp = <TInput, TOutput>(name: string, execute: (args: TInput) => Promise<TOutput>) => {
         return async (args: TInput): Promise<TOutput> => {

@@ -143,14 +143,6 @@ export interface BackgroundJobEvent {
   data_json?: string | null;
 }
 
-export interface ToolCallRecord {
-  name: string;
-  args?: unknown;
-  ok: boolean;
-  duration_ms?: number;
-  error?: string;
-}
-
 export interface TokenEstimateConfig {
   tokens_per_char: number;
   tokens_per_message: number;

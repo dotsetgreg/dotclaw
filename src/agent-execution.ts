@@ -2,6 +2,7 @@ import { buildAgentContext, AgentContext } from './agent-context.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
 import { getAllTasks, setGroupSession, logToolCalls } from './db.js';
 import { MAIN_GROUP_FOLDER, TIMEZONE } from './config.js';
+import type { TaskProfile } from './request-router.js';
 import { generateId } from './id.js';
 import { runWithAgentSemaphore } from './agent-semaphore.js';
 import { withGroupLock } from './locks.js';
@@ -97,7 +98,7 @@ export async function executeAgentRun(params: {
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
   disableMemoryExtraction?: boolean;
-  profile?: 'fast' | 'standard' | 'deep' | 'background';
+  profile?: TaskProfile;
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   maxToolSteps?: number;
   timeoutMs?: number;

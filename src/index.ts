@@ -589,6 +589,10 @@ async function handleAdminCommand(params: {
 
   if (command === 'skill-install') {
     if (requireMain('Installing skills')) return true;
+    if (!runtime.agent.skills.installEnabled) {
+      await reply('Skill installation is disabled in runtime config (`agent.skills.installEnabled`).');
+      return true;
+    }
     const isGlobal = args.includes('--global');
     const source = args.filter(a => a !== '--global')[0];
     if (!source) {

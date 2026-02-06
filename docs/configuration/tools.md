@@ -110,6 +110,22 @@ Example:
 }
 ```
 
+## Standard coding tools
+
+The agent has access to the following coding tools:
+
+- `Read` — Read file contents
+- `Write` — Write files
+- `Edit` — Replace text in files
+- `Glob` — Search for files by name pattern
+- `Grep` — Search file contents by regex
+- `Bash` — Run shell commands
+- `Python` — Execute Python code (sandboxed inside the container)
+- `WebSearch` — Search the web via Brave Search API
+- `WebFetch` — Fetch and extract content from a URL
+- `GitClone` — Clone a git repository
+- `NpmInstall` — Install npm packages
+
 ## Built-in DotClaw tools
 
 DotClaw injects MCP tools prefixed with `mcp__dotclaw__...` in addition to standard coding tools.

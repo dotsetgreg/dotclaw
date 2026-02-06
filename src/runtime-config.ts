@@ -38,6 +38,7 @@ export type RuntimeConfig = {
       runUid: string;
       runGid: string;
       instanceId: string;
+      daemonHeartbeatIntervalMs: number;
       daemon: {
         heartbeatMaxAgeMs: number;
         healthCheckIntervalMs: number;
@@ -367,6 +368,7 @@ export type RuntimeConfig = {
         command?: string;
         args?: string[];
         env?: Record<string, string>;
+        url?: string;
       }>;
       connectionTimeoutMs: number;
     };
@@ -429,6 +431,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       runUid: typeof process.getuid === 'function' ? String(process.getuid()) : '',
       runGid: typeof process.getgid === 'function' ? String(process.getgid()) : '',
       instanceId: '',
+      daemonHeartbeatIntervalMs: 1_000,
       daemon: {
         heartbeatMaxAgeMs: 30_000,
         healthCheckIntervalMs: 20_000,
