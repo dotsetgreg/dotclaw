@@ -88,7 +88,8 @@ async function executeHookScript(
     });
 
     proc.on('error', (err) => {
-      activeConcurrent -= 1;
+      // Don't decrement activeConcurrent here — Node.js guarantees 'close'
+      // fires after 'error' for spawned processes, so 'close' handles it.
       logger.error({ event: script.event, command: script.command, error: err.message }, 'Hook script failed to execute');
       resolve(null);
     });

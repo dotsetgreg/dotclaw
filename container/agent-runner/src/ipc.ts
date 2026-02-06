@@ -408,7 +408,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
     },
 
     async runTask(taskId: string) {
-      return requestResponse('run_task', { task_id: taskId }, config);
+      return requestResponse('run_task', { task_id: taskId }, config, 900_000);
     },
 
     async spawnJob(args: {

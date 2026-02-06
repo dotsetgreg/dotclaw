@@ -6,6 +6,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import yaml from 'js-yaml';
 import { GROUPS_DIR, CONTAINER_TIMEOUT } from './config.js';
 import { generateId } from './id.js';
 import { executeAgentRun } from './agent-execution.js';
@@ -66,7 +67,7 @@ function loadWorkflowDefinition(name: string, groupFolder: string): WorkflowDefi
   } else if (fs.existsSync(yamlPath)) {
     // Simple YAML parser for basic structures
     raw = fs.readFileSync(yamlPath, 'utf-8');
-    return parseSimpleYaml(raw);
+    return parseYamlWorkflow(raw);
   } else {
     return null;
   }
@@ -78,102 +79,48 @@ function loadWorkflowDefinition(name: string, groupFolder: string): WorkflowDefi
   }
 }
 
-function parseSimpleYaml(raw: string): WorkflowDefinition | null {
-  // Minimal YAML-like parsing for workflow files.
-  // For production use, consider adding js-yaml dependency.
+export function parseYamlWorkflow(raw: string): WorkflowDefinition | null {
   try {
-    // Convert simple YAML to JSON-like structure
-    const lines = raw.split('\n');
-    let name = '';
-    const steps: WorkflowStep[] = [];
-    let currentStep: Partial<WorkflowStep> | null = null;
-    let inSteps = false;
-    const trigger: WorkflowDefinition['trigger'] = {};
-    const onError: WorkflowDefinition['on_error'] = {};
-    let inTrigger = false;
-    let inOnError = false;
+    const parsed = yaml.load(raw) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== 'object') return null;
 
-    for (const line of lines) {
-      const trimmed = line.trimEnd();
-      if (!trimmed || trimmed.startsWith('#')) continue;
+    const name = typeof parsed.name === 'string' ? parsed.name : '';
+    if (!name) return null;
 
-      const indent = line.length - line.trimStart().length;
+    const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : [];
+    if (rawSteps.length === 0) return null;
 
-      if (indent === 0) {
-        if (trimmed.startsWith('name:')) {
-          name = trimmed.slice(5).trim().replace(/^['"]|['"]$/g, '');
-        } else if (trimmed === 'steps:') {
-          inSteps = true;
-          inTrigger = false;
-          inOnError = false;
-        } else if (trimmed === 'trigger:') {
-          inTrigger = true;
-          inSteps = false;
-          inOnError = false;
-        } else if (trimmed === 'on_error:') {
-          inOnError = true;
-          inSteps = false;
-          inTrigger = false;
-        }
-        continue;
-      }
+    const steps: WorkflowStep[] = rawSteps.map((s: Record<string, unknown>) => {
+      const step: WorkflowStep = {
+        name: String(s.name || ''),
+        prompt: String(s.prompt || '')
+      };
+      if (Array.isArray(s.depends_on)) step.depends_on = s.depends_on.map(String);
+      if (Array.isArray(s.tools)) step.tools = s.tools.map(String);
+      if (typeof s.timeout_ms === 'number') step.timeout_ms = s.timeout_ms;
+      if (typeof s.condition === 'string') step.condition = s.condition;
+      if (typeof s.model_override === 'string') step.model_override = s.model_override;
+      return step;
+    });
 
-      if (inTrigger && indent >= 2) {
-        const kv = trimmed.trim();
-        if (kv.startsWith('schedule:')) trigger.schedule = kv.slice(9).trim().replace(/^['"]|['"]$/g, '');
-        if (kv.startsWith('timezone:')) trigger.timezone = kv.slice(9).trim().replace(/^['"]|['"]$/g, '');
-        if (kv.startsWith('pattern:')) trigger.pattern = kv.slice(8).trim().replace(/^['"]|['"]$/g, '');
-      }
+    const result: WorkflowDefinition = { name, steps };
 
-      if (inOnError && indent >= 2) {
-        const kv = trimmed.trim();
-        if (kv.startsWith('notify:')) onError.notify = kv.slice(7).trim() === 'true';
-        if (kv.startsWith('retry:')) onError.retry = parseInt(kv.slice(6).trim(), 10);
-      }
-
-      if (inSteps) {
-        const stripped = trimmed.trim();
-        if (stripped.startsWith('- name:')) {
-          if (currentStep && currentStep.name) {
-            steps.push(currentStep as WorkflowStep);
-          }
-          currentStep = { name: stripped.slice(7).trim().replace(/^['"]|['"]$/g, '') };
-        } else if (currentStep && indent >= 4) {
-          if (stripped.startsWith('prompt:')) {
-            currentStep.prompt = stripped.slice(7).trim().replace(/^['"]|['"]$/g, '');
-          } else if (stripped.startsWith('timeout_ms:')) {
-            currentStep.timeout_ms = parseInt(stripped.slice(11).trim(), 10);
-          } else if (stripped.startsWith('model_override:')) {
-            currentStep.model_override = stripped.slice(15).trim().replace(/^['"]|['"]$/g, '');
-          } else if (stripped.startsWith('depends_on:')) {
-            const deps = stripped.slice(11).trim();
-            if (deps.startsWith('[')) {
-              currentStep.depends_on = deps.replace(/[[\]]/g, '').split(',').map(s => s.trim().replace(/^['"]|['"]$/g, ''));
-            }
-          } else if (stripped.startsWith('tools:')) {
-            const tools = stripped.slice(6).trim();
-            if (tools.startsWith('[')) {
-              currentStep.tools = tools.replace(/[[\]]/g, '').split(',').map(s => s.trim().replace(/^['"]|['"]$/g, ''));
-            }
-          } else if (stripped.startsWith('condition:')) {
-            currentStep.condition = stripped.slice(10).trim().replace(/^['"]|['"]$/g, '');
-          }
-        }
-      }
+    if (parsed.trigger && typeof parsed.trigger === 'object') {
+      const t = parsed.trigger as Record<string, unknown>;
+      result.trigger = {};
+      if (typeof t.schedule === 'string') result.trigger.schedule = t.schedule;
+      if (typeof t.timezone === 'string') result.trigger.timezone = t.timezone;
+      if (typeof t.pattern === 'string') result.trigger.pattern = t.pattern;
     }
 
-    if (currentStep && currentStep.name) {
-      steps.push(currentStep as WorkflowStep);
+    if (parsed.on_error && typeof parsed.on_error === 'object') {
+      const e = parsed.on_error as Record<string, unknown>;
+      result.on_error = {};
+      if (typeof e.notify === 'boolean') result.on_error.notify = e.notify;
+      if (typeof e.retry === 'number') result.on_error.retry = e.retry;
     }
 
-    if (!name || steps.length === 0) return null;
-
-    return {
-      name,
-      trigger: Object.keys(trigger).length > 0 ? trigger : undefined,
-      steps,
-      on_error: Object.keys(onError).length > 0 ? onError : undefined
-    };
+    return result;
   } catch {
     return null;
   }

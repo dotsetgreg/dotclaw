@@ -11,9 +11,7 @@ import type {
   MediaOptions,
   VoiceOptions,
   AudioOptions,
-  BaseOptions,
   ContactOptions,
-  PollOptions,
   ButtonRow,
 } from '../types.js';
 import { ProviderRegistry } from '../registry.js';
@@ -104,11 +102,11 @@ export class DiscordProvider implements MessagingProvider {
   async start(handlers: ProviderEventHandlers): Promise<void> {
     // Dynamically import discord.js — it's an optional dependency
     try {
-      // @ts-expect-error discord.js is an optional peer dependency
       this.discordJs = await import('discord.js');
-    } catch {
+    } catch (importErr) {
+      const detail = importErr instanceof Error ? importErr.message : String(importErr);
       throw new Error(
-        'discord.js is not installed. Run `npm install discord.js` to enable the Discord provider.'
+        `discord.js failed to load: ${detail}. Run \`npm install discord.js\` to install it.`
       );
     }
 
@@ -227,7 +225,7 @@ export class DiscordProvider implements MessagingProvider {
     return this.sendFileAttachment(chatId, filePath, caption);
   }
 
-  async sendLocation(chatId: string, lat: number, lng: number, _opts?: BaseOptions): Promise<SendResult> {
+  async sendLocation(chatId: string, lat: number, lng: number): Promise<SendResult> {
     const text = `\u{1F4CD} Location: https://maps.google.com/?q=${lat},${lng}`;
     return this.sendMessage(chatId, text);
   }
@@ -238,7 +236,7 @@ export class DiscordProvider implements MessagingProvider {
     return this.sendMessage(chatId, text);
   }
 
-  async sendPoll(chatId: string, question: string, options: string[], _opts?: PollOptions): Promise<SendResult> {
+  async sendPoll(chatId: string, question: string, options: string[]): Promise<SendResult> {
     // Discord's native poll API (discord.js v14.15+)
     // Fallback to text-based poll if the API is not available
     const rawChannelId = ProviderRegistry.stripPrefix(chatId);
@@ -273,7 +271,7 @@ export class DiscordProvider implements MessagingProvider {
     }
   }
 
-  async sendButtons(chatId: string, text: string, buttons: ButtonRow[], _opts?: BaseOptions): Promise<SendResult> {
+  async sendButtons(chatId: string, text: string, buttons: ButtonRow[]): Promise<SendResult> {
     const rawChannelId = ProviderRegistry.stripPrefix(chatId);
     if (!this.discordJs) return { success: false };
 

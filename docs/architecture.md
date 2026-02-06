@@ -9,12 +9,14 @@ title: Architecture
 ```
 Messaging providers (Telegram / Discord)
   -> Provider Registry
+  -> Request Router (fast/standard/deep/background classification)
   -> Message Pipeline (SQLite queue + batching)
   -> Docker container (agent runtime)
   -> IPC Dispatcher
   -> Response back to originating provider
 
-Background jobs follow the same path but run asynchronously and report completion when finished.
+Background jobs, orchestration, and workflows follow the same container
+path but run asynchronously. Hooks fire at lifecycle boundaries.
 ```
 
 ## Key directories

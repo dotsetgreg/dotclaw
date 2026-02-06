@@ -23,8 +23,13 @@ Single Node.js process that connects to messaging providers (Telegram + optional
 | `src/background-jobs.ts` | Durable background job queue |
 | `src/db.ts` | SQLite operations |
 | `src/memory-store.ts` | Long-term memory storage (SQLite) |
+| `src/request-router.ts` | Request classification and routing profiles |
+| `src/hooks.ts` | Lifecycle event hooks |
+| `src/workflow-engine.ts` | Declarative YAML/JSON workflow engine |
+| `src/workflow-store.ts` | Workflow state persistence (SQLite) |
+| `src/transcription.ts` | Voice message transcription |
 | `src/error-messages.ts` | User-friendly error mapping |
-| `src/runtime-config.ts` | Runtime configuration type and loading |
+| `src/runtime-config.ts` | Runtime configuration type and loading (with validation) |
 
 ## Skills
 

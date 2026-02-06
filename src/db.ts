@@ -248,6 +248,9 @@ function migrateChatJidPrefixes(): void {
     return;
   }
 
+  // Disable FK checks during migration — we're updating both parent (chats.jid)
+  // and child (messages.chat_jid) tables, and SQLite enforces FKs per-statement.
+  db.pragma('foreign_keys = OFF');
   const migrate = db.transaction(() => {
     // Prefix all tables with chat_jid / jid columns
     db.exec(`UPDATE chats SET jid = 'telegram:' || jid WHERE jid NOT LIKE '%:%'`);
@@ -263,7 +266,11 @@ function migrateChatJidPrefixes(): void {
     db.prepare(`INSERT INTO _migrations (key, applied_at) VALUES (?, ?)`).run('chat_jid_prefix_v1', new Date().toISOString());
   });
 
-  migrate();
+  try {
+    migrate();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
 }
 
 /**

@@ -146,10 +146,31 @@ Background jobs:
 - `mcp__dotclaw__cancel_job`
 - `mcp__dotclaw__job_update`
 
+Orchestration:
+
+- `mcp__dotclaw__orchestrate`
+
+Workflows:
+
+- `mcp__dotclaw__workflow_start`
+- `mcp__dotclaw__workflow_status`
+- `mcp__dotclaw__workflow_cancel`
+- `mcp__dotclaw__workflow_list`
+
 Memory:
 
 - `mcp__dotclaw__memory_upsert`
 - `mcp__dotclaw__memory_search`
+- `mcp__dotclaw__memory_list`
+- `mcp__dotclaw__memory_forget`
+- `mcp__dotclaw__memory_stats`
+
+Group management (main group only):
+
+- `mcp__dotclaw__register_group`
+- `mcp__dotclaw__remove_group`
+- `mcp__dotclaw__list_groups`
+- `mcp__dotclaw__set_model`
 
 Utility:
 

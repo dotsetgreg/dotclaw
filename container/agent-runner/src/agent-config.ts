@@ -149,8 +149,8 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
   openrouter: {
     timeoutMs: 180_000,
     retry: true,
-    siteUrl: '',
-    siteName: ''
+    siteUrl: 'https://github.com/dotsetlabs/dotclaw',
+    siteName: 'DotClaw'
   },
   promptPacks: {
     enabled: true,
@@ -181,11 +181,11 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     extractScheduled: false
   },
   models: {
-    summary: 'openai/gpt-5-nano',
-    memory: 'openai/gpt-5-mini',
-    planner: 'openai/gpt-5-nano',
-    responseValidation: 'openai/gpt-5-nano',
-    toolSummary: 'openai/gpt-5-nano'
+    summary: 'deepseek/deepseek-v3.2',
+    memory: 'deepseek/deepseek-v3.2',
+    planner: 'deepseek/deepseek-v3.2',
+    responseValidation: 'deepseek/deepseek-v3.2',
+    toolSummary: 'deepseek/deepseek-v3.2'
   },
   planner: {
     enabled: true,
@@ -245,7 +245,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     }
   },
   ipc: {
-    requestTimeoutMs: 6000,
+    requestTimeoutMs: 30_000,
     requestPollMs: 150
   },
   tokenEstimate: {

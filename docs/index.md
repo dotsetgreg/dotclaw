@@ -11,8 +11,11 @@ DotClaw is a personal OpenRouter-based assistant for Telegram and Discord. It ru
 - Multi-provider messaging (Telegram + Discord) with per-group isolation
 - Containerized agent runtime with strict mounts
 - Long-term memory, scheduled tasks, background jobs, and tool governance
+- Voice transcription and text-to-speech
+- Browser automation, MCP server integration, and lifecycle hooks
+- Multi-agent orchestration and declarative YAML workflows
 - Plugin tools and optional Autotune optimization
-- Prometheus-compatible metrics and structured logs
+- Prometheus-compatible metrics, status dashboard, and structured logs
 
 ## Quick links
 

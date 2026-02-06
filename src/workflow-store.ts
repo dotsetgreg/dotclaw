@@ -155,3 +155,29 @@ export function getStepResults(runId: string): WorkflowStepResult[] {
   const db = getDb();
   return db.prepare('SELECT * FROM workflow_step_results WHERE run_id = ? ORDER BY id').all(runId) as WorkflowStepResult[];
 }
+
+export function cleanupOldWorkflowRuns(retentionMs: number): number {
+  const db = getDb();
+  const cutoff = new Date(Date.now() - retentionMs).toISOString();
+  const rows = db.prepare(
+    `SELECT id FROM workflow_runs WHERE status IN ('completed', 'failed', 'canceled') AND finished_at < ?`
+  ).all(cutoff) as Array<{ id: string }>;
+  if (rows.length === 0) return 0;
+  const deleteSteps = db.prepare('DELETE FROM workflow_step_results WHERE run_id = ?');
+  const deleteRun = db.prepare('DELETE FROM workflow_runs WHERE id = ?');
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      deleteSteps.run(row.id);
+      deleteRun.run(row.id);
+    }
+  });
+  tx();
+  return rows.length;
+}
+
+export function closeWorkflowStore(): void {
+  if (db) {
+    db.close();
+    db = null;
+  }
+}

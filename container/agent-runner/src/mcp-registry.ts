@@ -45,11 +45,10 @@ function jsonSchemaToZod(schema: Record<string, unknown>): z.ZodTypeAny {
 
   switch (type) {
     case 'string': {
-      let s = z.string();
       if (schema.enum && Array.isArray(schema.enum) && schema.enum.length > 0) {
         return z.enum(schema.enum as [string, ...string[]]);
       }
-      return s;
+      return z.string();
     }
     case 'number':
     case 'integer':
@@ -94,7 +93,7 @@ export class McpToolRegistry {
 
         this.clients.set(serverConfig.name, client);
 
-        const mcpTools = await this.discoverServerTools(client, serverConfig.name);
+        const mcpTools = await this.discoverServerTools(client);
 
         for (const mcpTool of mcpTools) {
           const toolName = `mcp_ext__${serverConfig.name}__${mcpTool.name}`;
@@ -133,7 +132,7 @@ export class McpToolRegistry {
     return tools;
   }
 
-  private async discoverServerTools(client: McpStdioClient, _serverName: string): Promise<McpTool[]> {
+  private async discoverServerTools(client: McpStdioClient): Promise<McpTool[]> {
     await client.connect();
     return client.listTools();
   }

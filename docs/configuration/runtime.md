@@ -49,7 +49,7 @@ title: Runtime Config
         "onToolLimit": true,
         "classifier": {
           "enabled": true,
-          "model": "openai/gpt-5-nano",
+          "model": "deepseek/deepseek-v3.2",
           "timeoutMs": 3000,
           "maxOutputTokens": 32,
           "temperature": 0,
@@ -68,7 +68,7 @@ title: Runtime Config
       "classifierFallback": { "enabled": true, "minChars": 600 },
       "plannerProbe": {
         "enabled": true,
-        "model": "openai/gpt-5-nano",
+        "model": "deepseek/deepseek-v3.2",
         "timeoutMs": 3000,
         "maxOutputTokens": 120,
         "temperature": 0,
@@ -77,8 +77,8 @@ title: Runtime Config
         "minTools": 3
       },
       "profiles": {
-        "fast": { "model": "openai/gpt-5-nano", "maxOutputTokens": 4096, "maxToolSteps": 12, "enablePlanner": false },
-        "standard": { "model": "openai/gpt-5-mini", "maxOutputTokens": 4096, "maxToolSteps": 48 },
+        "fast": { "model": "deepseek/deepseek-v3.2", "maxOutputTokens": 4096, "maxToolSteps": 12, "enablePlanner": false },
+        "standard": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 4096, "maxToolSteps": 48 },
         "deep": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 4096, "maxToolSteps": 128 },
         "background": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 4096, "maxToolSteps": 256 }
       }
@@ -227,6 +227,90 @@ Profile fields (common):
 - `enableMemoryExtraction`: toggle memory extraction
 - `toolAllow` / `toolDeny`: per-profile tool policy overrides
 - `progress`: optional per-profile progress settings
+
+## Voice
+
+`host.voice` controls voice transcription and text-to-speech:
+
+```json
+{
+  "host": {
+    "voice": {
+      "transcription": {
+        "enabled": true,
+        "model": "google/gemini-2.5-flash",
+        "language": "",
+        "maxDurationSec": 300
+      },
+      "tts": {
+        "enabled": true,
+        "model": "edge-tts",
+        "defaultVoice": "en-US-AriaNeural"
+      }
+    }
+  }
+}
+```
+
+The agent-side TTS config is in `agent.tts`.
+
+## Hooks
+
+`hooks` controls lifecycle event scripts:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "maxConcurrent": 4,
+    "defaultTimeoutMs": 5000,
+    "scripts": [
+      {
+        "event": "message:received",
+        "command": "~/scripts/log-message.sh",
+        "blocking": false,
+        "timeoutMs": 3000
+      }
+    ]
+  }
+}
+```
+
+Supported events: `message:received`, `message:processing`, `message:responded`, `agent:start`, `agent:complete`, `job:spawned`, `job:completed`, `task:fired`, `task:completed`, `memory:upserted`.
+
+Blocking hooks receive JSON on stdin and can return `{"cancel": true}` to abort the operation.
+
+## Browser
+
+`agent.browser` controls in-container Chromium automation:
+
+- `enabled`: toggle browser tool availability (default `true`)
+- `timeoutMs`: navigation timeout (default `30000`)
+- `screenshotQuality`: JPEG quality for screenshots (default `80`)
+
+## MCP servers
+
+`agent.mcp` configures external MCP server connections:
+
+```json
+{
+  "agent": {
+    "mcp": {
+      "enabled": true,
+      "connectionTimeoutMs": 10000,
+      "servers": [
+        {
+          "name": "my-server",
+          "transport": "stdio",
+          "command": "node",
+          "args": ["path/to/server.js"],
+          "env": { "API_KEY": "..." }
+        }
+      ]
+    }
+  }
+}
+```
 
 ## Heartbeat
 

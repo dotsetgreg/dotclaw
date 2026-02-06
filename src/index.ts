@@ -58,6 +58,7 @@ import { startWakeDetector, stopWakeDetector } from './wake-detector.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { transcribeVoice } from './transcription.js';
 import { emitHook } from './hooks.js';
+import { closeWorkflowStore } from './workflow-store.js';
 import { invalidatePersonalizationCache } from './personalization.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
@@ -926,8 +927,12 @@ async function onWakeRecovery(sleepDurationMs: number): Promise<void> {
   suppressHealthChecks(60_000);
   resetUnhealthyDaemons();
 
-  // 2. Reconnect all providers
+  // 2. Reconnect all providers (skip those that were never started)
   for (const provider of providerRegistry.getAllProviders()) {
+    if (!provider.isConnected()) {
+      logger.debug({ provider: provider.name }, 'Skipping wake reconnect for inactive provider');
+      continue;
+    }
     try {
       if (provider.name === 'telegram') setTelegramConnected(false);
       await provider.stop();
@@ -1161,6 +1166,7 @@ async function main(): Promise<void> {
       cleanupInstanceContainers();
 
       // 6. Close databases
+      closeWorkflowStore();
       closeMemoryStore();
       closeDatabase();
 
@@ -1214,7 +1220,7 @@ async function main(): Promise<void> {
 
     logger.info('DotClaw running (responds to DMs and group mentions/replies)');
   } catch (error) {
-    logger.error({ error }, 'Failed to start providers');
+    logger.error({ err: error instanceof Error ? error : new Error(String(error)) }, 'Failed to start DotClaw');
     process.exit(1);
   }
 }
