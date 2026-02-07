@@ -26,6 +26,8 @@ import {
   saveMemoryState,
   writeHistory,
   estimateTokens,
+  pruneContextMessages,
+  limitHistoryTurns,
   MemoryConfig,
   Message
 } from './memory.js';
@@ -786,6 +788,10 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   appendHistory(sessionCtx, 'user', prompt);
   let history = loadHistory(sessionCtx);
 
+  if (agent.context.maxHistoryTurns > 0) {
+    history = limitHistoryTurns(history, agent.context.maxHistoryTurns);
+  }
+
   const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
   const adjustedRecentTokens = Math.max(1000, Math.floor(config.recentContextTokens * tokenRatio));
 
@@ -999,6 +1005,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     const resolvedAdjusted = Math.max(1000, Math.floor(resolvedMaxContext * tokenRatio));
     let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, resolvedAdjusted, 6);
     contextMessages = clampContextMessages(contextMessages, tokenEstimate.tokensPerChar, resolvedMaxContextMessageTokens);
+    contextMessages = pruneContextMessages(contextMessages, agent.context.contextPruning);
     return {
       instructions: resolvedInstructions,
       instructionsTokens: resolvedInstructionTokens,
@@ -1079,13 +1086,26 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
               seq++;
               const chunkFile = path.join(input.streamDir, `chunk_${String(seq).padStart(6, '0')}.txt`);
               const tmpFile = chunkFile + '.tmp';
-              fs.writeFileSync(tmpFile, delta);
-              fs.renameSync(tmpFile, chunkFile);
+              try {
+                fs.writeFileSync(tmpFile, delta);
+                fs.renameSync(tmpFile, chunkFile);
+              } catch (writeErr) {
+                log(`Stream write error at seq ${seq}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+                try { fs.writeFileSync(path.join(input.streamDir, 'error'), writeErr instanceof Error ? writeErr.message : String(writeErr)); } catch { /* ignore */ }
+                try { fs.writeFileSync(path.join(input.streamDir, 'done'), ''); } catch { /* ignore */ }
+                break;
+              }
             }
-            fs.writeFileSync(path.join(input.streamDir, 'done'), '');
+            // Write done sentinel if not already written by error handler
+            try {
+              if (!fs.existsSync(path.join(input.streamDir, 'done'))) {
+                fs.writeFileSync(path.join(input.streamDir, 'done'), '');
+              }
+            } catch { /* ignore */ }
           } catch (streamErr) {
             log(`Stream error: ${streamErr instanceof Error ? streamErr.message : String(streamErr)}`);
             try { fs.writeFileSync(path.join(input.streamDir, 'error'), streamErr instanceof Error ? streamErr.message : String(streamErr)); } catch { /* ignore */ }
+            try { fs.writeFileSync(path.join(input.streamDir, 'done'), ''); } catch { /* ignore */ }
           }
         }
 
@@ -1221,7 +1241,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   if (memoryExtractionEnabled && isDaemon && (!input.isScheduledTask || memoryExtractScheduled)) {
     // Fire-and-forget in daemon mode; skip entirely in ephemeral mode
     void runMemoryExtraction().catch((err) => {
-      log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`Memory extraction failed: ${errMsg}`);
+      // Write error to IPC status file so host can detect the failure
+      try {
+        const statusPath = path.join(IPC_DIR, 'memory_extraction_error.json');
+        fs.writeFileSync(statusPath, JSON.stringify({
+          error: errMsg,
+          timestamp: new Date().toISOString(),
+        }));
+      } catch { /* best-effort status write */ }
     });
   }
 

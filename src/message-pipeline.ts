@@ -46,6 +46,10 @@ const CANCEL_PHRASES = new Set([
   'cancel', 'stop', 'abort', 'cancel request', 'stop request'
 ]);
 
+function isSilentReply(text: string): boolean {
+  return /^\s*NO_REPLY\s*$/.test(text);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -607,7 +611,13 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       return output.replyToId;
     })();
 
-    if (output.result && output.result.trim()) {
+    if (output.result && output.result.trim() && isSilentReply(output.result)) {
+      logger.debug({ chatId: msg.chatId }, 'Agent returned NO_REPLY — suppressing message');
+      if (streaming) {
+        try { await streaming.cleanup(); } catch { /* best effort */ }
+      }
+      // Skip sending; still record telemetry below
+    } else if (output.result && output.result.trim()) {
       const hasVoiceAttachment = missedMessages.some(m => {
         if (!m.attachments_json) return false;
         try {
