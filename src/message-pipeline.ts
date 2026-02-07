@@ -681,7 +681,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
     } else if (output.tool_calls && output.tool_calls.length > 0) {
       await sendMessageForQueue(
         msg.chatId,
-        "I ran out of steps before I could finish. Try narrowing the scope or asking for a specific part.",
+        "I used some tools but wasn't able to produce a final response. Could you try rephrasing or ask me to continue?",
         { threadId: msg.threadId, replyToMessageId: resolvedReplyTo }
       );
     } else {
