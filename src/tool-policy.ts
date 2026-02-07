@@ -56,14 +56,24 @@ const DEFAULT_POLICY: ToolPolicy = {
     'mcp__dotclaw__memory_forget',
     'mcp__dotclaw__memory_list',
     'mcp__dotclaw__memory_search',
-    'mcp__dotclaw__memory_stats'
+    'mcp__dotclaw__memory_stats',
+    'Process',
+    'AnalyzeImage',
+    'mcp__dotclaw__get_config',
+    'mcp__dotclaw__set_tool_policy',
+    'mcp__dotclaw__set_behavior',
+    'mcp__dotclaw__set_mcp_config',
+    'mcp__dotclaw__subagent'
   ],
   deny: [],
   max_per_run: {
     Bash: 128,
     Python: 64,
     WebSearch: 40,
-    WebFetch: 60
+    WebFetch: 60,
+    Process: 128,
+    AnalyzeImage: 16,
+    mcp__dotclaw__subagent: 8
   },
   default_max_per_run: 256
 };

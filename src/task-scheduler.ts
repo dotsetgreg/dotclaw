@@ -7,7 +7,7 @@ import { ScheduledTask, RegisteredGroup } from './types.js';
 import { GROUPS_DIR, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
-import { routePrompt } from './request-router.js';
+import { routeRequest } from './request-router.js';
 import { writeTrace } from './trace-writer.js';
 import type { AgentContext } from './agent-context.js';
 import type { ContainerOutput } from './container-protocol.js';
@@ -228,7 +228,7 @@ ${task.prompt}` : task.prompt;
     inputText: task.prompt,
     source: 'dotclaw-scheduler'
   });
-  const routingDecision = routePrompt(taskPrompt);
+  const routingDecision = routeRequest();
 
   try {
     const execution = await executeAgentRun({
@@ -245,7 +245,6 @@ ${task.prompt}` : task.prompt;
       isScheduledTask: true,
       taskId: task.id,
       useGroupLock: false,
-      modelOverride: routingDecision.model,
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
       maxToolSteps: routingDecision.maxToolSteps,
       abortSignal: abortController.signal,
@@ -408,7 +407,7 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
     inputText: task.prompt,
     source: 'dotclaw-manual-task'
   });
-  const routingDecision = routePrompt(taskPrompt);
+  const routingDecision = routeRequest();
 
   try {
     const execution = await executeAgentRun({
@@ -424,7 +423,6 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
       isScheduledTask: true,
       taskId: task.id,
-      modelOverride: routingDecision.model,
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
       maxToolSteps: routingDecision.maxToolSteps,
       abortSignal: abortController.signal,

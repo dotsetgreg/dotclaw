@@ -160,4 +160,15 @@ export class McpToolRegistry {
   getDiscoveredTools(): Tool[] {
     return this.discoveredTools;
   }
+
+  /** Re-read config and rediscover all MCP tools (for hot-reload after config change) */
+  async reloadTools(
+    newConfig: AgentRuntimeConfig['agent']['mcp'],
+    wrapExecute: <TInput, TOutput>(name: string, execute: (args: TInput) => Promise<TOutput>) => (args: TInput) => Promise<TOutput>
+  ): Promise<Tool[]> {
+    await this.closeAll();
+    this.serverConfigs = newConfig.servers || [];
+    this.connectionTimeoutMs = newConfig.connectionTimeoutMs;
+    return this.discoverTools(wrapExecute);
+  }
 }

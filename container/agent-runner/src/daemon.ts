@@ -275,6 +275,21 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+// --- MCP hot-reload ---
+
+const MCP_RELOAD_FILE = '/workspace/ipc/mcp_reload';
+
+async function checkMcpReload(): Promise<void> {
+  try {
+    if (fs.existsSync(MCP_RELOAD_FILE)) {
+      fs.unlinkSync(MCP_RELOAD_FILE);
+      log('MCP reload signal detected — agent will pick up new config on next run');
+    }
+  } catch {
+    // ignore
+  }
+}
+
 // --- Main loop ---
 
 async function loop(): Promise<void> {
@@ -284,6 +299,7 @@ async function loop(): Promise<void> {
 
   while (!shuttingDown) {
     try {
+      await checkMcpReload();
       await processRequests();
     } catch (err) {
       log(`Daemon loop error: ${err instanceof Error ? err.message : String(err)}`);

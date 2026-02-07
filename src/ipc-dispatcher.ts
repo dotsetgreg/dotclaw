@@ -21,6 +21,7 @@ import {
 } from './memory-store.js';
 import { invalidatePersonalizationCache } from './personalization.js';
 import { loadModelRegistry, saveModelRegistry } from './model-registry.js';
+import type { RoutingRule } from './model-registry.js';
 import { logger } from './logger.js';
 import { generateId } from './id.js';
 import { isValidTimezone, normalizeTaskTimezone, parseScheduledTimestamp } from './timezone.js';
@@ -32,7 +33,14 @@ import {
   TIMEZONE,
   IPC_POLL_INTERVAL,
 } from './config.js';
+import {
+  RUNTIME_CONFIG_PATH,
+  BEHAVIOR_CONFIG_PATH,
+  TOOL_POLICY_PATH,
+} from './paths.js';
 import { runTaskNow } from './task-scheduler.js';
+import { executeAgentRun } from './agent-execution.js';
+import { loadJson, saveJson } from './utils.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -695,19 +703,78 @@ async function processTaskIpc(
         logger.warn({ sourceGroup }, 'Unauthorized set_model attempt blocked');
         break;
       }
+      const action = typeof data.action === 'string' ? data.action : 'set';
+      const defaultModel = runtime.host.defaultModel;
+      const config = loadModelRegistry(defaultModel);
+      const scope = typeof data.scope === 'string' ? data.scope : 'global';
+      const targetId = typeof data.target_id === 'string' ? data.target_id : undefined;
+
+      if (action === 'set_routing_rules' || action === 'clear_routing_rules') {
+        if (scope !== 'user' && scope !== 'group') {
+          logger.warn({ action, scope }, 'Routing rules require user or group scope');
+          break;
+        }
+        if (!targetId) {
+          logger.warn({ action, scope }, 'Routing rules require target_id');
+          break;
+        }
+        const nextConfig = { ...config };
+        if (action === 'clear_routing_rules') {
+          if (scope === 'user' && nextConfig.per_user?.[targetId]) {
+            delete nextConfig.per_user[targetId].routing_rules;
+          } else if (scope === 'group' && nextConfig.per_group?.[targetId]) {
+            delete nextConfig.per_group[targetId].routing_rules;
+          }
+        } else {
+          // set_routing_rules
+          const rawRules = Array.isArray(data.routing_rules) ? data.routing_rules : [];
+          const validatedRules: RoutingRule[] = [];
+          for (const raw of rawRules) {
+            if (!raw || typeof raw !== 'object') continue;
+            const r = raw as Record<string, unknown>;
+            const taskType = typeof r.task_type === 'string' ? r.task_type.trim() : '';
+            const ruleModel = typeof r.model === 'string' ? r.model.trim() : '';
+            const keywords = Array.isArray(r.keywords)
+              ? (r.keywords as unknown[]).filter((k): k is string => typeof k === 'string' && k.trim() !== '').map(k => k.toLowerCase().trim())
+              : [];
+            if (!taskType || !ruleModel || keywords.length === 0) continue;
+            if (config.allowlist.length > 0 && !config.allowlist.includes(ruleModel)) {
+              logger.warn({ model: ruleModel, taskType }, 'Routing rule model not in allowlist; skipping');
+              continue;
+            }
+            validatedRules.push({
+              task_type: taskType,
+              model: ruleModel,
+              keywords,
+              priority: typeof r.priority === 'number' && Number.isFinite(r.priority) ? r.priority : undefined,
+            });
+          }
+          if (scope === 'user') {
+            nextConfig.per_user = nextConfig.per_user || {};
+            nextConfig.per_user[targetId] = nextConfig.per_user[targetId] || { model: config.model };
+            nextConfig.per_user[targetId].routing_rules = validatedRules.length > 0 ? validatedRules : undefined;
+          } else {
+            nextConfig.per_group = nextConfig.per_group || {};
+            nextConfig.per_group[targetId] = nextConfig.per_group[targetId] || { model: config.model };
+            nextConfig.per_group[targetId].routing_rules = validatedRules.length > 0 ? validatedRules : undefined;
+          }
+        }
+        nextConfig.updated_at = new Date().toISOString();
+        saveModelRegistry(nextConfig);
+        logger.info({ action, scope, targetId }, 'Routing rules updated via IPC');
+        break;
+      }
+
+      // Default action: 'set' — original behavior
       if (!data.model || typeof data.model !== 'string') {
         logger.warn({ data }, 'Invalid set_model request - missing model');
         break;
       }
-      const defaultModel = runtime.host.defaultModel;
-      const config = loadModelRegistry(defaultModel);
       const nextModel = (data.model as string).trim();
       if (config.allowlist && config.allowlist.length > 0 && !config.allowlist.includes(nextModel)) {
         logger.warn({ model: nextModel }, 'Model not in allowlist; refusing set_model');
         break;
       }
-      const scope = typeof data.scope === 'string' ? data.scope : 'global';
-      const targetId = typeof data.target_id === 'string' ? data.target_id : undefined;
       if (scope === 'user' && !targetId) {
         logger.warn({ data }, 'set_model missing target_id for user scope');
         break;
@@ -721,10 +788,12 @@ async function processTaskIpc(
         nextConfig.model = nextModel;
       } else if (scope === 'group') {
         nextConfig.per_group = nextConfig.per_group || {};
-        nextConfig.per_group[targetId!] = { model: nextModel };
+        const existing = nextConfig.per_group[targetId!];
+        nextConfig.per_group[targetId!] = { ...existing, model: nextModel };
       } else if (scope === 'user') {
         nextConfig.per_user = nextConfig.per_user || {};
-        nextConfig.per_user[targetId!] = { model: nextModel };
+        const existing = nextConfig.per_user[targetId!];
+        nextConfig.per_user[targetId!] = { ...existing, model: nextModel };
       }
       nextConfig.updated_at = new Date().toISOString();
       saveModelRegistry(nextConfig);
@@ -864,10 +933,286 @@ async function processRequestIpc(
         await provider.deleteMessage(chatJid, messageId);
         return { id: requestId, ok: true, result: { deleted: true } };
       }
+      case 'get_config': {
+        const section = typeof payload.section === 'string' ? payload.section : 'all';
+        const runtimeCfg = loadRuntimeConfig();
+        const modelCfg = loadModelRegistry(runtimeCfg.host.defaultModel);
+        const toolPolicyCfg = loadJson<Record<string, unknown>>(TOOL_POLICY_PATH, {});
+        const behaviorCfg = loadJson<Record<string, unknown>>(BEHAVIOR_CONFIG_PATH, {});
+
+        const configSections: Record<string, unknown> = {
+          model: {
+            current: modelCfg.model,
+            allowlist: modelCfg.allowlist,
+            per_user: modelCfg.per_user,
+            per_group: modelCfg.per_group,
+          },
+          tools: toolPolicyCfg,
+          behavior: behaviorCfg,
+          mcp: runtimeCfg.agent?.mcp || { enabled: false, servers: [] },
+          routing: runtimeCfg.host.routing || {},
+        };
+
+        const result = section === 'all' ? configSections : (configSections[section] ?? null);
+        return { id: requestId, ok: true, result: { config: result } };
+      }
+      case 'set_tool_policy': {
+        if (!isMain) {
+          return { id: requestId, ok: false, error: 'Only the main group can modify tool policy.' };
+        }
+        const action = typeof payload.action === 'string' ? payload.action : '';
+        const toolName = typeof payload.tool_name === 'string' ? payload.tool_name.trim() : '';
+        const limit = typeof payload.limit === 'number' ? payload.limit : undefined;
+
+        const policy = loadJson<{
+          default?: { allow?: string[]; deny?: string[]; max_per_run?: Record<string, number>; default_max_per_run?: number };
+        }>(TOOL_POLICY_PATH, {});
+        if (!policy.default) policy.default = {};
+
+        switch (action) {
+          case 'allow_tool': {
+            if (!toolName) return { id: requestId, ok: false, error: 'tool_name required' };
+            const allow = policy.default.allow || [];
+            if (!allow.includes(toolName)) allow.push(toolName);
+            policy.default.allow = allow;
+            const deny = policy.default.deny || [];
+            policy.default.deny = deny.filter(t => t !== toolName);
+            break;
+          }
+          case 'deny_tool': {
+            if (!toolName) return { id: requestId, ok: false, error: 'tool_name required' };
+            const deny = policy.default.deny || [];
+            if (!deny.includes(toolName)) deny.push(toolName);
+            policy.default.deny = deny;
+            break;
+          }
+          case 'set_limit': {
+            if (!toolName || typeof limit !== 'number') return { id: requestId, ok: false, error: 'tool_name and limit required' };
+            const maxPerRun = policy.default.max_per_run || {};
+            maxPerRun[toolName] = Math.max(1, Math.round(limit));
+            policy.default.max_per_run = maxPerRun;
+            break;
+          }
+          case 'reset':
+            delete policy.default;
+            break;
+          default:
+            return { id: requestId, ok: false, error: `Unknown action: ${action}` };
+        }
+        saveJson(TOOL_POLICY_PATH, policy);
+        return { id: requestId, ok: true, result: { policy: policy.default || {} } };
+      }
+      case 'set_behavior': {
+        const behavior = loadJson<Record<string, unknown>>(BEHAVIOR_CONFIG_PATH, {});
+        const validStyles = ['concise', 'balanced', 'detailed'];
+        if (typeof payload.response_style === 'string' && validStyles.includes(payload.response_style)) {
+          behavior.response_style = payload.response_style;
+        }
+        if (typeof payload.tool_calling_bias === 'number') {
+          behavior.tool_calling_bias = Math.max(0, Math.min(1, payload.tool_calling_bias));
+        }
+        if (typeof payload.caution_bias === 'number') {
+          behavior.caution_bias = Math.max(0, Math.min(1, payload.caution_bias));
+        }
+        saveJson(BEHAVIOR_CONFIG_PATH, behavior);
+        invalidatePersonalizationCache(sourceGroup);
+        return { id: requestId, ok: true };
+      }
+      case 'set_mcp_config': {
+        if (!isMain) {
+          return { id: requestId, ok: false, error: 'Only the main group can modify MCP config.' };
+        }
+        const action = typeof payload.action === 'string' ? payload.action : '';
+        const runtimeCfg = loadJson<Record<string, unknown>>(RUNTIME_CONFIG_PATH, {});
+        const agent = (runtimeCfg.agent || {}) as Record<string, unknown>;
+        const mcp = (agent.mcp || { enabled: false, servers: [] }) as {
+          enabled: boolean;
+          servers: Array<{ name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string> }>;
+        };
+
+        switch (action) {
+          case 'enable':
+            mcp.enabled = true;
+            break;
+          case 'disable':
+            mcp.enabled = false;
+            break;
+          case 'add_server': {
+            const name = typeof payload.name === 'string' ? payload.name.trim() : '';
+            const command = typeof payload.command === 'string' ? payload.command.trim() : '';
+            if (!name || !command) return { id: requestId, ok: false, error: 'name and command required' };
+            if (mcp.servers.some(s => s.name === name)) {
+              return { id: requestId, ok: false, error: `Server "${name}" already exists` };
+            }
+            mcp.servers.push({
+              name,
+              transport: 'stdio',
+              command,
+              args: Array.isArray(payload.args_list) ? payload.args_list as string[] : undefined,
+              env: payload.env && typeof payload.env === 'object' ? payload.env as Record<string, string> : undefined,
+            });
+            break;
+          }
+          case 'remove_server': {
+            const name = typeof payload.name === 'string' ? payload.name.trim() : '';
+            if (!name) return { id: requestId, ok: false, error: 'name required' };
+            mcp.servers = mcp.servers.filter(s => s.name !== name);
+            break;
+          }
+          default:
+            return { id: requestId, ok: false, error: `Unknown MCP action: ${action}` };
+        }
+        agent.mcp = mcp;
+        runtimeCfg.agent = agent;
+        saveJson(RUNTIME_CONFIG_PATH, runtimeCfg);
+
+        // Signal daemon to reload MCP
+        const ipcBaseDir = path.join(DATA_DIR, 'ipc');
+        for (const groupFolder of fs.readdirSync(ipcBaseDir).filter(f => {
+          try { return fs.statSync(path.join(ipcBaseDir, f)).isDirectory() && f !== 'errors'; } catch { return false; }
+        })) {
+          const reloadFile = path.join(ipcBaseDir, groupFolder, 'mcp_reload');
+          try { fs.writeFileSync(reloadFile, Date.now().toString()); } catch { /* ignore */ }
+        }
+
+        return { id: requestId, ok: true, result: { mcp } };
+      }
+      case 'spawn_subagent': {
+        const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
+        if (!prompt) {
+          return { id: requestId, ok: false, error: 'prompt is required' };
+        }
+        const registeredGroupsMap = deps.registeredGroups();
+        const groupEntry = Object.entries(registeredGroupsMap).find(([, g]) => g.folder === sourceGroup);
+        if (!groupEntry) {
+          return { id: requestId, ok: false, error: 'Source group not registered' };
+        }
+        const [chatJid, group] = groupEntry;
+        const subagentId = generateId('sub');
+        const model = typeof payload.model === 'string' ? payload.model.trim() : undefined;
+        const maxToolSteps = typeof payload.maxToolSteps === 'number' ? payload.maxToolSteps : 50;
+        const timeoutMs = typeof payload.timeoutMs === 'number' ? payload.timeoutMs : 300_000;
+        const label = typeof payload.label === 'string' ? payload.label : undefined;
+
+        // Track the sub-agent run
+        const subagentRuns = getSubagentRuns();
+        subagentRuns.set(subagentId, {
+          id: subagentId,
+          status: 'running',
+          label,
+          startedAt: Date.now(),
+        });
+
+        // Fire and forget
+        executeAgentRun({
+          group,
+          prompt,
+          chatJid,
+          recallQuery: prompt,
+          recallMaxResults: 4,
+          recallMaxTokens: 1000,
+          modelOverride: model,
+          maxToolSteps,
+          timeoutMs,
+          useSemaphore: true,
+          useGroupLock: false,
+          persistSession: false,
+          isScheduledTask: true, // avoid sending message directly
+        }).then(({ output }) => {
+          const run = subagentRuns.get(subagentId);
+          if (run) {
+            run.status = 'completed';
+            run.result = output.result ?? undefined;
+            run.model = output.model;
+            run.tokens_prompt = output.tokens_prompt;
+            run.tokens_completion = output.tokens_completion;
+            run.runtimeMs = Date.now() - run.startedAt;
+          }
+        }).catch((err) => {
+          const run = subagentRuns.get(subagentId);
+          if (run) {
+            run.status = 'failed';
+            run.error = err instanceof Error ? err.message : String(err);
+            run.runtimeMs = Date.now() - run.startedAt;
+          }
+        });
+
+        return { id: requestId, ok: true, result: { subagentId } };
+      }
+      case 'subagent_status': {
+        const subagentRuns = getSubagentRuns();
+        if (payload.action === 'list') {
+          const runs = Array.from(subagentRuns.values()).map(r => ({
+            id: r.id,
+            status: r.status,
+            label: r.label,
+            runtimeMs: r.runtimeMs || (Date.now() - r.startedAt),
+          }));
+          return { id: requestId, ok: true, result: { runs } };
+        }
+        const subId = typeof payload.subagentId === 'string' ? payload.subagentId : '';
+        const run = subagentRuns.get(subId);
+        if (!run) return { id: requestId, ok: false, error: `Sub-agent not found: ${subId}` };
+        return {
+          id: requestId,
+          ok: true,
+          result: {
+            status: run.status,
+            label: run.label,
+            runtimeMs: run.runtimeMs || (Date.now() - run.startedAt),
+          }
+        };
+      }
+      case 'subagent_result': {
+        const subagentRuns = getSubagentRuns();
+        const subId = typeof payload.subagentId === 'string' ? payload.subagentId : '';
+        const run = subagentRuns.get(subId);
+        if (!run) return { id: requestId, ok: false, error: `Sub-agent not found: ${subId}` };
+        return {
+          id: requestId,
+          ok: true,
+          result: {
+            status: run.status,
+            result: run.status !== 'running' ? (run.result ?? null) : undefined,
+            error: run.error,
+            runtimeMs: run.runtimeMs || (Date.now() - run.startedAt),
+            model: run.model,
+            tokens_prompt: run.tokens_prompt,
+            tokens_completion: run.tokens_completion,
+          }
+        };
+      }
       default:
         return { id: requestId, ok: false, error: `Unknown request type: ${data.type}` };
     }
   } catch (err) {
     return { id: requestId, ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+// --- Sub-agent run tracking ---
+interface SubagentRun {
+  id: string;
+  status: 'running' | 'completed' | 'failed';
+  label?: string;
+  startedAt: number;
+  runtimeMs?: number;
+  result?: string;
+  error?: string;
+  model?: string;
+  tokens_prompt?: number;
+  tokens_completion?: number;
+}
+
+const _subagentRuns = new Map<string, SubagentRun>();
+
+function getSubagentRuns(): Map<string, SubagentRun> {
+  // Clean up old completed runs (>10 min after start)
+  const now = Date.now();
+  for (const [id, run] of _subagentRuns) {
+    if (run.status !== 'running' && (now - run.startedAt) > 600_000) {
+      _subagentRuns.delete(id);
+    }
+  }
+  return _subagentRuns;
 }

@@ -149,6 +149,7 @@ export type RuntimeConfig = {
     routing: {
       model: string;
       fallbacks: string[];
+      allowedModels: string[];
       maxOutputTokens: number;
       maxToolSteps: number;
       temperature?: number;
@@ -160,6 +161,11 @@ export type RuntimeConfig = {
       chunkFlushIntervalMs: number;
       editIntervalMs: number;
       maxEditLength: number;
+    };
+    webhook: {
+      enabled: boolean;
+      port: number;
+      token: string;
     };
     toolBudgets: {
       enabled: boolean;
@@ -456,6 +462,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     routing: {
       model: 'moonshotai/kimi-k2.5',
       fallbacks: [],
+      allowedModels: [],
       maxOutputTokens: 0,
       maxToolSteps: 200,
       temperature: 0.2,
@@ -467,6 +474,11 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       chunkFlushIntervalMs: 200,
       editIntervalMs: 400,
       maxEditLength: 3800,
+    },
+    webhook: {
+      enabled: false,
+      port: 3003,
+      token: '',
     },
     toolBudgets: {
       enabled: false,
@@ -646,6 +658,12 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   // Streaming
   h.streaming.editIntervalMs = clampMin(h.streaming.editIntervalMs, 100, 'host.streaming.editIntervalMs');
   h.streaming.maxEditLength = clampMin(h.streaming.maxEditLength, 100, 'host.streaming.maxEditLength');
+
+  // Webhook
+  h.webhook.port = clampMin(h.webhook.port, 1024, 'host.webhook.port');
+  if (h.webhook.enabled && !h.webhook.token) {
+    console.warn('[runtime-config] host.webhook.enabled but token is empty — auth will reject all requests');
+  }
 
   // Hooks
   config.hooks.maxConcurrent = clampMin(config.hooks.maxConcurrent, 1, 'hooks.maxConcurrent');

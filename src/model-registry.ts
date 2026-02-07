@@ -1,10 +1,18 @@
 import path from 'path';
 import fs from 'fs';
-import { DATA_DIR, MODEL_CONFIG_PATH } from './paths.js';
+import { getDotclawHome } from './paths.js';
 import { loadJson, saveJson } from './utils.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { TokenEstimateConfig } from './types.js';
 import { logger } from './logger.js';
+
+function resolveModelConfigPath(): string {
+  return path.join(getDotclawHome(), 'config', 'model.json');
+}
+
+function resolveCapabilitiesPath(): string {
+  return path.join(getDotclawHome(), 'data', 'model-capabilities.json');
+}
 
 export interface ModelOverride {
   context_window?: number;
@@ -21,19 +29,26 @@ export interface ModelPricing {
   currency?: 'USD';
 }
 
+export interface RoutingRule {
+  task_type: string;
+  model: string;
+  keywords: string[];
+  priority?: number;
+}
+
 export interface ModelConfig {
   model: string;
   allowlist: string[];
   overrides?: Record<string, ModelOverride>;
   pricing?: Record<string, ModelPricing>;
-  per_group?: Record<string, { model: string }>;
-  per_user?: Record<string, { model: string }>;
+  per_group?: Record<string, { model: string; routing_rules?: RoutingRule[] }>;
+  per_user?: Record<string, { model: string; routing_rules?: RoutingRule[] }>;
   updated_at?: string;
 }
 
 const runtime = loadRuntimeConfig();
 
-const MODEL_CAPABILITIES_PATH = path.join(DATA_DIR, 'model-capabilities.json');
+// Capabilities cache path resolved dynamically (respects DOTCLAW_HOME changes)
 const CAPABILITIES_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export interface ModelCapabilities {
@@ -58,7 +73,7 @@ export function loadModelRegistry(defaultModel: string): ModelConfig {
     model: defaultModel,
     allowlist: []
   };
-  const config = loadJson<ModelConfig>(MODEL_CONFIG_PATH, fallback);
+  const config = loadJson<ModelConfig>(resolveModelConfigPath(), fallback);
   config.model = typeof config.model === 'string' && config.model.trim() ? config.model.trim() : defaultModel;
   config.allowlist = Array.isArray(config.allowlist)
     ? config.allowlist.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
@@ -67,14 +82,33 @@ export function loadModelRegistry(defaultModel: string): ModelConfig {
 }
 
 export function saveModelRegistry(config: ModelConfig): void {
-  saveJson(MODEL_CONFIG_PATH, config);
+  saveJson(resolveModelConfigPath(), config);
+}
+
+/**
+ * Match a message against routing rules. Returns the first matching rule
+ * (sorted by priority descending, then insertion order), or null.
+ */
+export function matchRoutingRule(rules: RoutingRule[] | undefined, messageText: string): RoutingRule | null {
+  if (!rules || rules.length === 0) return null;
+  const text = messageText.toLowerCase();
+  const sorted = [...rules].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+  for (const rule of sorted) {
+    for (const keyword of rule.keywords) {
+      if (keyword && text.includes(keyword)) {
+        return rule;
+      }
+    }
+  }
+  return null;
 }
 
 export function resolveModel(params: {
   groupFolder: string;
   userId?: string | null;
   defaultModel: string;
-}): { model: string; override?: ModelOverride } {
+  messageText?: string;
+}): { model: string; override?: ModelOverride; matchedRule?: RoutingRule } {
   const config = loadModelRegistry(params.defaultModel);
   let model = config.model;
 
@@ -93,8 +127,28 @@ export function resolveModel(params: {
     model = config.model;
   }
 
+  // Routing rules: user rules checked first (most specific), then group
+  let matchedRule: RoutingRule | null = null;
+  if (params.messageText) {
+    if (params.userId) {
+      const userEntry = config.per_user?.[params.userId];
+      matchedRule = matchRoutingRule(userEntry?.routing_rules, params.messageText);
+    }
+    if (!matchedRule) {
+      const groupEntry = config.per_group?.[params.groupFolder];
+      matchedRule = matchRoutingRule(groupEntry?.routing_rules, params.messageText);
+    }
+    if (matchedRule) {
+      if (config.allowlist.length === 0 || config.allowlist.includes(matchedRule.model)) {
+        model = matchedRule.model;
+      } else {
+        matchedRule = null; // blocked by allowlist
+      }
+    }
+  }
+
   const override = config.overrides?.[model];
-  return { model, override };
+  return { model, override, matchedRule: matchedRule ?? undefined };
 }
 
 export function getTokenEstimateConfig(override?: ModelOverride): TokenEstimateConfig {
@@ -137,8 +191,8 @@ export function getModelPricing(config: ModelConfig, model: string): ModelPricin
  */
 function loadCapabilitiesCache(): ModelCapabilitiesCache | null {
   try {
-    if (!fs.existsSync(MODEL_CAPABILITIES_PATH)) return null;
-    const raw = fs.readFileSync(MODEL_CAPABILITIES_PATH, 'utf-8');
+    if (!fs.existsSync(resolveCapabilitiesPath())) return null;
+    const raw = fs.readFileSync(resolveCapabilitiesPath(), 'utf-8');
     const data = JSON.parse(raw) as ModelCapabilitiesCache;
 
     // Check if cache is still valid
@@ -159,8 +213,8 @@ function loadCapabilitiesCache(): ModelCapabilitiesCache | null {
  */
 function saveCapabilitiesCache(cache: ModelCapabilitiesCache): void {
   try {
-    fs.mkdirSync(path.dirname(MODEL_CAPABILITIES_PATH), { recursive: true });
-    fs.writeFileSync(MODEL_CAPABILITIES_PATH, JSON.stringify(cache, null, 2));
+    fs.mkdirSync(path.dirname(resolveCapabilitiesPath()), { recursive: true });
+    fs.writeFileSync(resolveCapabilitiesPath(), JSON.stringify(cache, null, 2));
   } catch (err) {
     logger.warn({ err }, 'Failed to save model capabilities cache');
   }

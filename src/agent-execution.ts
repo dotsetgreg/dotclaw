@@ -129,7 +129,8 @@ export async function executeAgentRun(params: {
     recallMaxTokens: params.recallMaxTokens,
     toolAllow: params.toolAllow,
     toolDeny: params.toolDeny,
-    recallEnabled: params.recallMaxResults > 0 && params.recallMaxTokens > 0
+    recallEnabled: params.recallMaxResults > 0 && params.recallMaxTokens > 0,
+    messageText: params.recallQuery
   });
 
   // Context window guard

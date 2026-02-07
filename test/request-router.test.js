@@ -42,12 +42,45 @@ test('routeRequest respects runtime.json overrides', async () => {
   });
 });
 
-test('routePrompt returns same as routeRequest', async () => {
+test('routeRequest filters fallbacks with allowedModels', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-router-'));
+  const configDir = path.join(tempDir, 'config');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(path.join(configDir, 'runtime.json'), JSON.stringify({
+    host: {
+      routing: {
+        model: 'primary/model',
+        fallbacks: ['allowed/model', 'blocked/model', 'also-allowed/model'],
+        allowedModels: ['allowed/model', 'also-allowed/model']
+      }
+    }
+  }, null, 2));
   await withTempHome(tempDir, async () => {
-    const { routeRequest, routePrompt } = await importFresh(distPath('request-router.js'));
-    const a = routeRequest();
-    const b = routePrompt('anything');
-    assert.deepEqual(a, b);
+    const { routeRequest } = await importFresh(distPath('request-router.js'));
+    const decision = routeRequest();
+    // Primary model always kept even if not in allowlist
+    assert.equal(decision.model, 'primary/model');
+    // Fallbacks filtered to only allowed models
+    assert.deepEqual(decision.fallbacks, ['allowed/model', 'also-allowed/model']);
+  });
+});
+
+test('routeRequest keeps all fallbacks when allowedModels is empty', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-router-'));
+  const configDir = path.join(tempDir, 'config');
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(path.join(configDir, 'runtime.json'), JSON.stringify({
+    host: {
+      routing: {
+        model: 'primary/model',
+        fallbacks: ['a/model', 'b/model'],
+        allowedModels: []
+      }
+    }
+  }, null, 2));
+  await withTempHome(tempDir, async () => {
+    const { routeRequest } = await importFresh(distPath('request-router.js'));
+    const decision = routeRequest();
+    assert.deepEqual(decision.fallbacks, ['a/model', 'b/model']);
   });
 });

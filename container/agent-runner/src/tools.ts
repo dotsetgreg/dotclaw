@@ -8,6 +8,11 @@ import { z } from 'zod';
 import { createIpcHandlers, IpcContext } from './ipc.js';
 import type { AgentRuntimeConfig } from './agent-config.js';
 import { collectSkillPluginDirs } from './skill-loader.js';
+import {
+  startProcess, listSessions, pollSession, getLog,
+  writeToSession, killSession, removeSession,
+  configureProcessRegistry,
+} from './process-registry.js';
 
 type ToolConfig = {
   name: string;
@@ -2022,18 +2027,31 @@ export function createTools(
 
   const setModelTool = tool({
     name: 'mcp__dotclaw__set_model',
-    description: 'Set the active OpenRouter model (main group only).',
+    description: 'Set the active OpenRouter model or configure task-type routing rules (main group only). Use action "set" (default) to set a static model. Use action "set_routing_rules" to configure keyword-based model routing — build comprehensive keyword lists from the user\'s request. Use action "clear_routing_rules" to remove all routing rules for a target.',
     inputSchema: z.object({
-      model: z.string().describe('OpenRouter model ID (e.g., moonshotai/kimi-k2.5)'),
+      action: z.enum(['set', 'set_routing_rules', 'clear_routing_rules']).optional().describe('Action to perform (default: "set")'),
+      model: z.string().optional().describe('OpenRouter model ID (required for action "set")'),
       scope: z.enum(['global', 'group', 'user']).optional(),
-      target_id: z.string().optional().describe('Optional group folder or user id for scoped overrides')
+      target_id: z.string().optional().describe('Group folder or user id for scoped overrides'),
+      routing_rules: z.array(z.object({
+        task_type: z.string().describe('Category name (e.g., "code", "research", "creative")'),
+        model: z.string().describe('OpenRouter model ID for this task type'),
+        keywords: z.array(z.string()).describe('Lowercase trigger phrases — build comprehensive lists'),
+        priority: z.number().optional().describe('Higher = checked first (default 0)')
+      })).optional().describe('Routing rules (for set_routing_rules action)')
     }),
     outputSchema: z.object({
       ok: z.boolean(),
       error: z.string().optional()
     }),
-    execute: wrapExecute('mcp__dotclaw__set_model', async ({ model, scope, target_id }: { model: string; scope?: 'global' | 'group' | 'user'; target_id?: string }) =>
-      ipc.setModel({ model, scope, target_id }))
+    execute: wrapExecute('mcp__dotclaw__set_model', async ({ action, model, scope, target_id, routing_rules }: {
+      action?: 'set' | 'set_routing_rules' | 'clear_routing_rules';
+      model?: string;
+      scope?: 'global' | 'group' | 'user';
+      target_id?: string;
+      routing_rules?: Array<{ task_type: string; model: string; keywords: string[]; priority?: number }>;
+    }) =>
+      ipc.setModel({ action, model, scope, target_id, routing_rules }))
   });
 
   const memoryUpsertTool = tool({
@@ -2134,6 +2152,251 @@ export function createTools(
     }),
     execute: wrapExecute('mcp__dotclaw__memory_stats', async (args: { userId?: string; target_group?: string }) =>
       ipc.memoryStats(args))
+  });
+
+  // --- Config & Self-Configuration Tools ---
+  const getConfigTool = tool({
+    name: 'mcp__dotclaw__get_config',
+    description: 'Inspect current DotClaw configuration. Returns model settings, tool policy, behavior config, MCP config, or routing config.',
+    inputSchema: z.object({
+      section: z.enum(['model', 'tools', 'behavior', 'mcp', 'routing', 'all']).optional().describe('Config section to retrieve (default: all)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      config: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__get_config', async (args: { section?: string }) =>
+      ipc.getConfig(args))
+  });
+
+  const setToolPolicyTool = tool({
+    name: 'mcp__dotclaw__set_tool_policy',
+    description: 'Modify tool policy (main group only). Actions: allow_tool, deny_tool, set_limit, reset.',
+    inputSchema: z.object({
+      action: z.enum(['allow_tool', 'deny_tool', 'set_limit', 'reset']).describe('Policy action'),
+      tool_name: z.string().optional().describe('Tool name (for allow/deny/set_limit)'),
+      limit: z.number().int().positive().optional().describe('Max calls per run (for set_limit)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      policy: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__set_tool_policy', async (args: { action: string; tool_name?: string; limit?: number }) =>
+      ipc.setToolPolicy(args))
+  });
+
+  const setBehaviorTool = tool({
+    name: 'mcp__dotclaw__set_behavior',
+    description: 'Adjust agent behavior settings. Fields: response_style (concise/balanced/detailed), tool_calling_bias (0-1), caution_bias (0-1).',
+    inputSchema: z.object({
+      response_style: z.enum(['concise', 'balanced', 'detailed']).optional(),
+      tool_calling_bias: z.number().min(0).max(1).optional(),
+      caution_bias: z.number().min(0).max(1).optional()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__set_behavior', async (args: { response_style?: string; tool_calling_bias?: number; caution_bias?: number }) =>
+      ipc.setBehavior(args))
+  });
+
+  const setMcpConfigTool = tool({
+    name: 'mcp__dotclaw__set_mcp_config',
+    description: 'Manage MCP server configuration (main group only). Actions: enable, disable, add_server, remove_server. Changes take effect on next daemon restart.',
+    inputSchema: z.object({
+      action: z.enum(['enable', 'disable', 'add_server', 'remove_server']).describe('MCP config action'),
+      name: z.string().optional().describe('Server name (for add/remove)'),
+      command: z.string().optional().describe('Server command (for add_server)'),
+      args_list: z.array(z.string()).optional().describe('Server args (for add_server)'),
+      env: z.record(z.string(), z.string()).optional().describe('Server env vars (for add_server)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      mcp: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__set_mcp_config', async (args: {
+      action: string; name?: string; command?: string; args_list?: string[]; env?: Record<string, string>;
+    }) => ipc.setMcpConfig(args))
+  });
+
+  // --- Sub-Agent Tool ---
+  const subagentTool = tool({
+    name: 'mcp__dotclaw__subagent',
+    description: 'Spawn and manage sub-agent tasks. Sub-agents run in parallel with their own tool budgets. Use for parallel research, long computations, or tasks requiring a different model.',
+    inputSchema: z.object({
+      action: z.enum(['spawn', 'list', 'status', 'result']).describe('Sub-agent action'),
+      prompt: z.string().optional().describe('Task prompt (for spawn)'),
+      model: z.string().optional().describe('Model override (for spawn)'),
+      label: z.string().optional().describe('Display label (for spawn)'),
+      maxToolSteps: z.number().int().positive().optional().describe('Max tool steps (for spawn, default 50)'),
+      timeoutMs: z.number().int().positive().optional().describe('Timeout in ms (for spawn/result)'),
+      subagentId: z.string().optional().describe('Sub-agent ID (for status/result)')
+    }),
+    outputSchema: z.any(),
+    execute: wrapExecute('mcp__dotclaw__subagent', async (args: {
+      action: string; prompt?: string; model?: string; label?: string;
+      maxToolSteps?: number; timeoutMs?: number; subagentId?: string;
+    }) => {
+      switch (args.action) {
+        case 'spawn': {
+          if (!args.prompt) return { ok: false, error: 'prompt is required for spawn' };
+          return ipc.spawnSubagent({
+            prompt: args.prompt,
+            model: args.model,
+            label: args.label,
+            maxToolSteps: args.maxToolSteps,
+            timeoutMs: args.timeoutMs,
+          });
+        }
+        case 'list':
+          return ipc.subagentStatus({ action: 'list' });
+        case 'status': {
+          if (!args.subagentId) return { ok: false, error: 'subagentId is required for status' };
+          return ipc.subagentStatus({ subagentId: args.subagentId });
+        }
+        case 'result': {
+          if (!args.subagentId) return { ok: false, error: 'subagentId is required for result' };
+          return ipc.subagentResult({ subagentId: args.subagentId, timeoutMs: args.timeoutMs });
+        }
+        default:
+          return { ok: false, error: `Unknown action: ${args.action}` };
+      }
+    })
+  });
+
+  // --- Process Tool ---
+  configureProcessRegistry({
+    maxSessions: config.process.maxSessions,
+    maxOutputBytes: config.process.maxOutputBytes,
+    defaultTimeoutMs: config.process.defaultTimeoutMs,
+  });
+
+  const processTool = tool({
+    name: 'Process',
+    description: 'Manage background processes. Use for long-running commands (builds, servers, data pipelines). Actions: start (launch background process), list (show all sessions), poll (get new output since last poll), log (get full output with offset/limit), write (send stdin), kill (send signal), remove (clean up finished session).',
+    inputSchema: z.object({
+      action: z.enum(['start', 'list', 'poll', 'log', 'write', 'kill', 'remove']).describe('Action to perform'),
+      command: z.string().optional().describe('Shell command (for start)'),
+      sessionId: z.string().optional().describe('Session ID (for poll/log/write/kill/remove)'),
+      data: z.string().optional().describe('Data to write to stdin (for write)'),
+      timeoutMs: z.number().int().positive().optional().describe('Timeout in ms (for start, default 1800000)'),
+      cwd: z.string().optional().describe('Working directory (for start, default /workspace/group)'),
+      offset: z.number().int().min(0).optional().describe('Character offset (for log)'),
+      limit: z.number().int().positive().optional().describe('Character limit (for log)'),
+      signal: z.string().optional().describe('Signal name (for kill, default SIGTERM)')
+    }),
+    outputSchema: z.any(),
+    execute: wrapExecute('Process', async (args: {
+      action: string;
+      command?: string;
+      sessionId?: string;
+      data?: string;
+      timeoutMs?: number;
+      cwd?: string;
+      offset?: number;
+      limit?: number;
+      signal?: string;
+    }) => {
+      switch (args.action) {
+        case 'start': {
+          if (!args.command) return { error: 'command is required for start' };
+          const result = startProcess(args.command, {
+            cwd: args.cwd,
+            timeoutMs: args.timeoutMs,
+          });
+          return result;
+        }
+        case 'list':
+          return { sessions: listSessions() };
+        case 'poll': {
+          if (!args.sessionId) return { error: 'sessionId is required for poll' };
+          return pollSession(args.sessionId);
+        }
+        case 'log': {
+          if (!args.sessionId) return { error: 'sessionId is required for log' };
+          return getLog(args.sessionId, args.offset, args.limit);
+        }
+        case 'write': {
+          if (!args.sessionId) return { error: 'sessionId is required for write' };
+          if (typeof args.data !== 'string') return { error: 'data is required for write' };
+          writeToSession(args.sessionId, args.data);
+          return { ok: true };
+        }
+        case 'kill': {
+          if (!args.sessionId) return { error: 'sessionId is required for kill' };
+          killSession(args.sessionId, args.signal);
+          return { ok: true };
+        }
+        case 'remove': {
+          if (!args.sessionId) return { error: 'sessionId is required for remove' };
+          removeSession(args.sessionId);
+          return { ok: true };
+        }
+        default:
+          return { error: `Unknown action: ${args.action}` };
+      }
+    })
+  });
+
+  // --- AnalyzeImage Tool ---
+  const analyzeImageTool = tool({
+    name: 'AnalyzeImage',
+    description: 'Analyze an image file using a vision-capable model. Reads the image from the workspace and returns a text description.',
+    inputSchema: z.object({
+      path: z.string().describe('Path to image file in the workspace'),
+      prompt: z.string().optional().describe('What to analyze (default: "Describe this image in detail")'),
+    }),
+    outputSchema: z.object({
+      description: z.string(),
+      model: z.string(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('AnalyzeImage', async (args: { path: string; prompt?: string }) => {
+      const imagePath = resolvePath(args.path, isMain, true);
+      const ext = path.extname(imagePath).toLowerCase();
+      const mimeMap: Record<string, string> = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+      };
+      const mime = mimeMap[ext] || 'image/png';
+      const imageData = fs.readFileSync(imagePath);
+      const base64 = imageData.toString('base64');
+      const dataUrl = `data:${mime};base64,${base64}`;
+      const userPrompt = args.prompt || 'Describe this image in detail';
+
+      const headers = buildOpenRouterHeaders(runtime);
+      if (!headers) return { description: '', model: 'none', error: 'OPENROUTER_API_KEY not set' };
+
+      const visionModel = process.env.DOTCLAW_VISION_MODEL || 'openai/gpt-4o';
+      const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: visionModel,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: userPrompt },
+              { type: 'image_url', image_url: { url: dataUrl } }
+            ]
+          }],
+          max_completion_tokens: 1024,
+          temperature: 0.2,
+        }),
+      }, 60_000, 'AnalyzeImage');
+
+      const bodyText = await response.text();
+      if (!response.ok) {
+        return { description: '', model: visionModel, error: `API error (${response.status}): ${bodyText.slice(0, 300)}` };
+      }
+      const data = JSON.parse(bodyText);
+      const content = data?.choices?.[0]?.message?.content ?? '';
+      return { description: String(content).trim(), model: visionModel };
+    })
   });
 
   // --- Browser Tool ---
@@ -2240,6 +2503,11 @@ export function createTools(
     removeGroupTool,
     listGroupsTool,
     setModelTool,
+    getConfigTool,
+    setToolPolicyTool,
+    setBehaviorTool,
+    setMcpConfigTool,
+    subagentTool,
     ...pluginTools
   ];
 
@@ -2250,12 +2518,14 @@ export function createTools(
   if (enableBash) {
     tools.push(bashTool as Tool);
     tools.push(pythonTool as Tool);
+    tools.push(processTool as Tool);
   }
   if (enableWebSearch) tools.push(webSearchTool as Tool);
   if (enableWebFetch) {
     tools.push(webFetchTool as Tool);
     tools.push(downloadUrlTool as Tool);
   }
+  tools.push(analyzeImageTool as Tool);
 
   return tools;
 }

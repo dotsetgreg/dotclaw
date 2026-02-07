@@ -107,9 +107,12 @@ Chat IDs are prefixed: `telegram:123456`, `discord:789012`. The provider registr
 | `src/task-scheduler.ts` | Cron and one-off scheduled tasks |
 | `src/db.ts` | SQLite schema and operations |
 | `src/memory-store.ts` | Long-term memory with embeddings and FTS |
-| `container/agent-runner/src/index.ts` | Agent entry point (OpenRouter calls, tool loop) |
+| `src/webhook.ts` | Optional HTTP webhook endpoint for programmatic agent invocation |
+| `container/agent-runner/src/index.ts` | Agent entry point (OpenRouter calls, tool loop, model fallbacks) |
 | `container/agent-runner/src/daemon.ts` | Daemon mode: request polling, worker threads, heartbeat |
+| `container/agent-runner/src/system-prompt.ts` | Structured system prompt builder (section-based, full/minimal modes) |
 | `container/agent-runner/src/tools.ts` | Tool definitions and execution |
+| `container/agent-runner/src/memory.ts` | Conversation compaction, multi-part summarization, token estimation |
 | `container/agent-runner/src/skill-loader.ts` | Skill discovery and catalog building |
 | `container/agent-runner/src/agent-config.ts` | Container-side config (reads mounted runtime.json) |
 

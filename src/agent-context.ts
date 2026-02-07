@@ -80,15 +80,18 @@ export async function buildAgentContext(params: {
   toolAllow?: string[];
   toolDeny?: string[];
   recallEnabled?: boolean;
+  messageText?: string;
 }): Promise<AgentContext> {
   const startedAt = Date.now();
   const runtime = loadRuntimeConfig();
-  const defaultModel = runtime.host.defaultModel;
+  // Use routing.model as the base — model.json per_user/per_group overrides take priority
+  const defaultModel = runtime.host.routing.model || runtime.host.defaultModel;
   const modelRegistry = loadModelRegistry(defaultModel);
   const resolvedModel = resolveModel({
     groupFolder: params.groupFolder,
     userId: params.userId ?? null,
-    defaultModel
+    defaultModel,
+    messageText: params.messageText
   });
   const tokenEstimate = getTokenEstimateConfig(resolvedModel.override);
   const modelPricing = getModelPricing(modelRegistry, resolvedModel.model);

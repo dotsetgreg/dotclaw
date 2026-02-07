@@ -49,9 +49,32 @@ export interface MemoryConfig {
   memoryMaxTokens: number;
 }
 
+/**
+ * Improved token estimation using character-class weighting.
+ * More accurate than bytes/4 for code/markdown/mixed content.
+ * - ASCII letters/digits: ~0.25 tokens per char
+ * - Whitespace/punctuation: ~0.5 tokens per char (frequent tokenizer boundaries)
+ * - Non-ASCII (CJK, emoji, etc.): ~0.5 tokens per char (multi-byte → often 1 token)
+ * - Code-heavy content has more punctuation → higher ratio
+ */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
-  return Math.ceil(Buffer.byteLength(text, 'utf-8') / 4);
+  let weighted = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code > 127) {
+      weighted += 0.5; // Non-ASCII: CJK, emoji, accented chars
+    } else if (
+      (code >= 48 && code <= 57) ||  // 0-9
+      (code >= 65 && code <= 90) ||  // A-Z
+      (code >= 97 && code <= 122)    // a-z
+    ) {
+      weighted += 0.25; // Alphanumeric
+    } else {
+      weighted += 0.5; // Whitespace, punctuation, operators
+    }
+  }
+  return Math.ceil(weighted);
 }
 
 export function createSessionContext(sessionRoot: string, sessionId?: string): { ctx: SessionContext; isNew: boolean } {
@@ -182,6 +205,74 @@ export function splitRecentHistory(messages: Message[], tokenBudget: number, min
 
 export function shouldCompact(totalTokens: number, config: MemoryConfig): boolean {
   return totalTokens >= config.compactionTriggerTokens;
+}
+
+/**
+ * Split messages into roughly equal token-share chunks for multi-part summarization.
+ * Each chunk gets approximately totalTokens/parts tokens worth of messages.
+ */
+export function splitMessagesByTokenShare(messages: Message[], parts: number): Message[][] {
+  if (messages.length === 0) return [];
+  if (parts <= 1) return [messages];
+
+  const totalTokens = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
+  const targetPerPart = Math.ceil(totalTokens / parts);
+  const chunks: Message[][] = [];
+  let current: Message[] = [];
+  let currentTokens = 0;
+
+  for (const msg of messages) {
+    const msgTokens = estimateTokens(msg.content);
+    if (currentTokens + msgTokens > targetPerPart && current.length > 0 && chunks.length < parts - 1) {
+      chunks.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(msg);
+    currentTokens += msgTokens;
+  }
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
+/**
+ * Build a multi-part summary prompt. Each chunk is summarized with the context
+ * of the previous partial summaries for continuity.
+ */
+export function buildMultiPartSummaryPrompt(
+  existingSummary: string,
+  existingFacts: string[],
+  messageChunk: Message[],
+  partIndex: number,
+  totalParts: number,
+  previousPartSummaries: string[]
+) {
+  const summaryText = existingSummary || 'None.';
+  const factsText = existingFacts.length > 0 ? existingFacts.map(f => `- ${f}`).join('\n') : 'None.';
+  const messagesText = messageChunk.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
+  const prevContext = previousPartSummaries.length > 0
+    ? `Previous part summaries:\n${previousPartSummaries.map((s, i) => `Part ${i + 1}: ${s}`).join('\n')}`
+    : '';
+
+  const instructions = [
+    'You maintain long-term memory for a personal assistant.',
+    `This is part ${partIndex + 1} of ${totalParts} of a conversation compaction.`,
+    'Update the summary and facts using the NEW messages for this part.',
+    'Keep the summary concise, chronological, and focused on durable information.',
+    'Facts should be short, specific, and stable. Avoid transient or speculative details.',
+    'Return JSON only with keys: summary (string), facts (array of strings).'
+  ].join('\n');
+
+  const input = [
+    `Existing summary:\n${summaryText}`,
+    `Existing facts:\n${factsText}`,
+    prevContext,
+    `New messages (part ${partIndex + 1}/${totalParts}):\n${messagesText}`
+  ].filter(Boolean).join('\n\n');
+
+  return { instructions, input };
 }
 
 export function formatTranscriptMarkdown(messages: Message[], title?: string | null): string {

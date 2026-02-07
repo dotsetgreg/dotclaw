@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y \
     tree \
     ripgrep \
     graphviz \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (not in standard Debian repos)
@@ -51,7 +52,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN echo 'node ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/node && chmod 0440 /etc/sudoers.d/node
 
 # Install common Python packages
-RUN pip3 install --break-system-packages pandas numpy requests beautifulsoup4 matplotlib Pillow openpyxl pyyaml tabulate chardet
+RUN pip3 install --break-system-packages pandas numpy requests beautifulsoup4 matplotlib Pillow openpyxl pyyaml tabulate chardet pdfminer.six httpx lxml cssselect python-docx python-pptx
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

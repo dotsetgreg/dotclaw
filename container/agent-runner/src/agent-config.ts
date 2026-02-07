@@ -33,7 +33,6 @@ export type AgentRuntimeConfig = {
       maxTokens: number;
       extraction: {
         enabled: boolean;
-        async: boolean;
         maxMessages: number;
         maxOutputTokens: number;
       };
@@ -98,6 +97,9 @@ export type AgentRuntimeConfig = {
       model: string;
       baseUrl: string;
       defaultVoice: string;
+      provider: 'edge-tts' | 'openai';
+      openaiModel: string;
+      openaiVoice: string;
     };
     browser: {
       enabled: boolean;
@@ -123,6 +125,11 @@ export type AgentRuntimeConfig = {
       enabled: boolean;
       maxSkills: number;
       maxSummaryChars: number;
+    };
+    process: {
+      maxSessions: number;
+      maxOutputBytes: number;
+      defaultTimeoutMs: number;
     };
   };
 };
@@ -161,7 +168,6 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     maxTokens: 2000,
     extraction: {
       enabled: true,
-      async: true,
       maxMessages: 4,
       maxOutputTokens: 1024
     },
@@ -189,7 +195,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
       timeoutMs: 20_000
     },
     bash: {
-      timeoutMs: 120_000,
+      timeoutMs: 600_000,
       outputLimitBytes: 200_000
     },
     grepMaxFileBytes: 1_000_000,
@@ -225,7 +231,10 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     enabled: true,
     model: 'edge-tts',
     baseUrl: '',
-    defaultVoice: 'en-US-AriaNeural'
+    defaultVoice: 'en-US-AriaNeural',
+    provider: 'edge-tts',
+    openaiModel: 'tts-1',
+    openaiVoice: 'alloy'
   },
   browser: {
     enabled: true,
@@ -233,7 +242,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     screenshotQuality: 80
   },
   mcp: {
-    enabled: false,
+    enabled: true,
     servers: [],
     connectionTimeoutMs: 10_000
   },
@@ -244,6 +253,11 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     enabled: true,
     maxSkills: 32,
     maxSummaryChars: 4000,
+  },
+  process: {
+    maxSessions: 16,
+    maxOutputBytes: 1_048_576,
+    defaultTimeoutMs: 1_800_000,
   }
 };
 

@@ -411,15 +411,23 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       return requestResponse('run_task', { task_id: taskId }, config, 900_000);
     },
 
-    async setModel(args: { model: string; scope?: 'global' | 'group' | 'user'; target_id?: string }) {
+    async setModel(args: {
+      action?: 'set' | 'set_routing_rules' | 'clear_routing_rules';
+      model?: string;
+      scope?: 'global' | 'group' | 'user';
+      target_id?: string;
+      routing_rules?: Array<{ task_type: string; model: string; keywords: string[]; priority?: number }>;
+    }) {
       if (!isMain) {
         return { ok: false, error: 'Only the main group can change the model.' };
       }
       writeIpcFile(TASKS_DIR, {
         type: 'set_model',
+        action: args.action,
         model: args.model,
         scope: args.scope,
         target_id: args.target_id,
+        routing_rules: args.routing_rules,
         groupFolder,
         chatJid,
         timestamp: new Date().toISOString()
@@ -468,6 +476,73 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       return requestResponse('memory_stats', {
         userId: args.userId,
         target_group: args.target_group
+      }, config);
+    },
+
+    async getConfig(args: { section?: string }) {
+      return requestResponse('get_config', {
+        section: args.section || 'all'
+      }, config);
+    },
+
+    async setToolPolicy(args: { action: string; tool_name?: string; limit?: number }) {
+      return requestResponse('set_tool_policy', {
+        action: args.action,
+        tool_name: args.tool_name,
+        limit: args.limit
+      }, config);
+    },
+
+    async setBehavior(args: { response_style?: string; tool_calling_bias?: number; caution_bias?: number }) {
+      return requestResponse('set_behavior', {
+        response_style: args.response_style,
+        tool_calling_bias: args.tool_calling_bias,
+        caution_bias: args.caution_bias
+      }, config);
+    },
+
+    async setMcpConfig(args: { action: string; name?: string; command?: string; args_list?: string[]; env?: Record<string, string> }) {
+      return requestResponse('set_mcp_config', {
+        action: args.action,
+        name: args.name,
+        command: args.command,
+        args_list: args.args_list,
+        env: args.env
+      }, config);
+    },
+
+    async spawnSubagent(args: { prompt: string; model?: string; label?: string; maxToolSteps?: number; timeoutMs?: number }) {
+      return requestResponse('spawn_subagent', {
+        prompt: args.prompt,
+        model: args.model,
+        label: args.label,
+        maxToolSteps: args.maxToolSteps,
+        timeoutMs: args.timeoutMs
+      }, config);
+    },
+
+    async subagentStatus(args: { subagentId?: string; action?: string }) {
+      return requestResponse('subagent_status', {
+        subagentId: args.subagentId,
+        action: args.action
+      }, config);
+    },
+
+    async subagentResult(args: { subagentId: string; timeoutMs?: number }) {
+      const timeout = args.timeoutMs || 120_000;
+      const deadline = Date.now() + timeout;
+      const pollInterval = 2_000;
+      while (Date.now() < deadline) {
+        const resp = await requestResponse('subagent_result', {
+          subagentId: args.subagentId,
+        }, config);
+        if (!resp.ok) return resp;
+        if (resp.result?.status !== 'running') return resp;
+        await new Promise(r => setTimeout(r, Math.min(pollInterval, deadline - Date.now())));
+      }
+      // Final check
+      return requestResponse('subagent_result', {
+        subagentId: args.subagentId,
       }, config);
     },
 

@@ -455,7 +455,6 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         sessionId: sessions[group.folder],
         onSessionUpdate: (sessionId) => { deps.setSession(group.folder, sessionId); },
         availableGroups: deps.buildAvailableGroupsSnapshot(),
-        modelOverride: routing.model,
         modelFallbacks: routing.fallbacks,
         reasoningEffort: loadRuntimeConfig().agent.reasoning.effort,
         modelMaxOutputTokens: routing.maxOutputTokens || undefined,
@@ -601,6 +600,13 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
 
     updateChatState(msg.chatId, msg.timestamp, msg.messageId);
 
+    // Resolve reply target: container can override with [[reply_to:...]] tags
+    const resolvedReplyTo = (() => {
+      if (!output.replyToId) return replyToMessageId;
+      if (output.replyToId === '__current__') return replyToMessageId;
+      return output.replyToId;
+    })();
+
     if (output.result && output.result.trim()) {
       const hasVoiceAttachment = missedMessages.some(m => {
         if (!m.attachments_json) return false;
@@ -622,14 +628,14 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
             if (streaming) {
               await streaming.finalize(output.result);
             } else {
-              await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+              await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId: resolvedReplyTo });
             }
           }
         } else {
           if (streaming) {
             await streaming.finalize(output.result);
           } else {
-            await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+            await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId: resolvedReplyTo });
           }
         }
       } else {
@@ -644,7 +650,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
             }
           }
         } else {
-          const sendResult = await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+          const sendResult = await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId: resolvedReplyTo });
           const sentMessageId = sendResult.messageId;
           if (sentMessageId) {
             try {
@@ -666,11 +672,11 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       await sendMessageForQueue(
         msg.chatId,
         "I ran out of steps before I could finish. Try narrowing the scope or asking for a specific part.",
-        { threadId: msg.threadId, replyToMessageId }
+        { threadId: msg.threadId, replyToMessageId: resolvedReplyTo }
       );
     } else {
       logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
-      await sendMessageForQueue(msg.chatId, "I wasn't able to come up with a response. Could you try rephrasing?", { threadId: msg.threadId, replyToMessageId });
+      await sendMessageForQueue(msg.chatId, "I wasn't able to come up with a response. Could you try rephrasing?", { threadId: msg.threadId, replyToMessageId: resolvedReplyTo });
     }
 
     if (context) {

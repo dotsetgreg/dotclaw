@@ -19,15 +19,19 @@ import {
   shouldCompact,
   archiveConversation,
   buildSummaryPrompt,
+  buildMultiPartSummaryPrompt,
+  splitMessagesByTokenShare,
   parseSummaryResponse,
   retrieveRelevantMemories,
   saveMemoryState,
   writeHistory,
+  estimateTokens,
   MemoryConfig,
   Message
 } from './memory.js';
 import { loadPromptPackWithCanary, formatPromptPack, PromptPack } from './prompt-packs.js';
-import { buildSkillCatalog, formatSkillCatalog, type SkillCatalog } from './skill-loader.js';
+import { buildSkillCatalog, type SkillCatalog } from './skill-loader.js';
+import { buildSystemPrompt } from './system-prompt.js';
 
 type OpenRouterResult = ReturnType<OpenRouter['callModel']>;
 
@@ -49,6 +53,51 @@ const PROMPT_PACKS_ENABLED = agent.promptPacks.enabled;
 const PROMPT_PACKS_MAX_CHARS = agent.promptPacks.maxChars;
 const PROMPT_PACKS_MAX_DEMOS = agent.promptPacks.maxDemos;
 const PROMPT_PACKS_CANARY_RATE = agent.promptPacks.canaryRate;
+
+// ── Model cooldown tracking ──────────────────────────────────────────
+// After a model fails, put it in cooldown. 429 → 60s, 5xx/timeout → 300s.
+const modelCooldowns = new Map<string, number>(); // model → cooldown-until epoch ms
+
+function isModelInCooldown(model: string): boolean {
+  const until = modelCooldowns.get(model);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelCooldowns.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function cooldownModel(model: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  let durationMs = 300_000; // default: 5 min for 5xx/timeout
+  if (/429|rate.?limit/.test(lower)) {
+    durationMs = 60_000; // 1 min for rate limits
+  }
+  modelCooldowns.set(model, Date.now() + durationMs);
+  log(`Model ${model} in cooldown for ${durationMs / 1000}s`);
+}
+
+// ── Reply tag parsing ────────────────────────────────────────────────
+// Parse [[reply_to_current]] and [[reply_to:<id>]] tags from agent output.
+export function parseReplyTags(text: string): { cleanText: string; replyToId?: string } {
+  if (!text) return { cleanText: text };
+  const replyCurrentMatch = text.match(/\[\[reply_to_current\]\]/);
+  const replyIdMatch = text.match(/\[\[reply_to:(\d+)\]\]/);
+  let replyToId: string | undefined;
+  let cleanText = text;
+
+  if (replyIdMatch) {
+    replyToId = replyIdMatch[1];
+    cleanText = cleanText.replace(/\[\[reply_to:\d+\]\]/g, '').trim();
+  } else if (replyCurrentMatch) {
+    replyToId = '__current__'; // sentinel — host resolves to the triggering message
+    cleanText = cleanText.replace(/\[\[reply_to_current\]\]/g, '').trim();
+  }
+
+  return { cleanText, replyToId };
+}
 
 let cachedOpenRouter: OpenRouter | null = null;
 let cachedOpenRouterKey = '';
@@ -321,9 +370,7 @@ function estimateMessagesTokens(messages: Message[], tokensPerChar: number, toke
   return total;
 }
 
-const MEMORY_SUMMARY_MAX_CHARS = 2000;
-
-function buildSystemInstructions(params: {
+function buildInstructions(params: {
   assistantName: string;
   groupNotes?: string | null;
   globalNotes?: string | null;
@@ -350,184 +397,37 @@ function buildSystemInstructions(params: {
   memoryRecallPack?: PromptPack | null;
   maxToolSteps?: number;
 }): string {
-  const toolGuidance = [
-    'Key tool rules:',
-    '- User attachments arrive in /workspace/group/inbox/ (see <attachment> tags). Process with Read/Bash/Python.',
-    '- To send media from the web: download_url → send_photo/send_file/send_audio.',
-    '- Charts/plots: matplotlib → savefig → send_photo. Graphviz → dot -Tpng → send_photo.',
-    '- Voice messages are auto-transcribed (<transcript> in <attachment>). Reply with normal text — the host auto-converts to voice.',
-    '- GitHub CLI (`gh`) is available if GH_TOKEN is set.',
-    '- plugin__* and mcp_ext__* tools may be available if configured.'
-  ].join('\n');
-
-  const browserAutomation = agentConfig.agent.browser.enabled ? [
-    'Browser Tool: actions: navigate, snapshot, click, fill, screenshot, extract, evaluate, close.',
-    'Use snapshot with interactive=true for clickable refs (@e1, @e2). Screenshots → /workspace/group/screenshots/.'
-  ].join('\n') : '';
-
-  const hasAnyMemory = params.memorySummary || params.memoryFacts.length > 0 ||
-    params.longTermRecall.length > 0 || params.userProfile;
-
-  const memorySummary = params.memorySummary
-    ? params.memorySummary.slice(0, MEMORY_SUMMARY_MAX_CHARS)
-    : '';
-  const memoryFacts = params.memoryFacts.length > 0
-    ? params.memoryFacts.map(fact => `- ${fact}`).join('\n')
-    : '';
-  const sessionRecall = params.sessionRecall.length > 0
-    ? params.sessionRecall.map(item => `- ${item}`).join('\n')
-    : '';
-  const longTermRecall = params.longTermRecall.length > 0
-    ? params.longTermRecall.map(item => `- ${item}`).join('\n')
-    : '';
-  const userProfile = params.userProfile || '';
-  const memoryStats = params.memoryStats
-    ? `Total: ${params.memoryStats.total}, User: ${params.memoryStats.user}, Group: ${params.memoryStats.group}, Global: ${params.memoryStats.global}`
-    : '';
-
-  const availableGroups = params.availableGroups && params.availableGroups.length > 0
-    ? params.availableGroups
-      .map(group => `- ${group.name} (chat ${group.jid}, last: ${group.lastActivity})`)
-      .join('\n')
-    : '';
-
-  const groupNotes = params.groupNotes ? `Group notes:\n${params.groupNotes}` : '';
-  const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
-  const skillNotes = params.skillCatalog ? formatSkillCatalog(params.skillCatalog) : '';
-
-  const toolReliability = params.toolReliability && params.toolReliability.length > 0
-    ? params.toolReliability
-      .sort((a, b) => a.success_rate - b.success_rate)
-      .slice(0, 20)
-      .map(tool => {
-        const pct = `${Math.round(tool.success_rate * 100)}%`;
-        const avg = Number.isFinite(tool.avg_duration_ms) ? `${Math.round(tool.avg_duration_ms!)}ms` : 'n/a';
-        return `- ${tool.name}: success ${pct} over ${tool.count} calls (avg ${avg})`;
-      })
-      .join('\n')
-    : '';
-
-  const behaviorNotes: string[] = [];
-  const responseStyle = typeof params.behaviorConfig?.response_style === 'string'
-    ? String(params.behaviorConfig.response_style)
-    : '';
-  if (responseStyle === 'concise') {
-    behaviorNotes.push('Keep responses short and to the point.');
-  } else if (responseStyle === 'detailed') {
-    behaviorNotes.push('Give detailed, step-by-step responses when helpful.');
-  }
-  const toolBias = typeof params.behaviorConfig?.tool_calling_bias === 'number'
-    ? Number(params.behaviorConfig.tool_calling_bias)
-    : null;
-  if (toolBias !== null && toolBias < 0.4) {
-    behaviorNotes.push('Ask before using tools unless the intent is obvious.');
-  } else if (toolBias !== null && toolBias > 0.6) {
-    behaviorNotes.push('Use tools proactively when they add accuracy or save time.');
-  }
-  const cautionBias = typeof params.behaviorConfig?.caution_bias === 'number'
-    ? Number(params.behaviorConfig.caution_bias)
-    : null;
-  if (cautionBias !== null && cautionBias > 0.6) {
-    behaviorNotes.push('Double-check uncertain facts and flag limitations.');
-  }
-
-  const timezoneNote = params.timezone
-    ? `Timezone: ${params.timezone}. Use this timezone when interpreting or presenting timestamps unless the user specifies another.`
-    : '';
-
-  const hostPlatformNote = params.hostPlatform
-    ? (params.hostPlatform.startsWith('linux')
-      ? `Host platform: ${params.hostPlatform} (matches container).`
-      : `You are running inside a Linux container, but the user's host machine is ${params.hostPlatform}. Prefer pnpm over npm for installing packages — it generates cross-platform lockfiles. node_modules and package-lock.json are automatically cleaned up after your run finishes (pnpm-lock.yaml is preserved). You do NOT need to delete them yourself. The user will need to run \`pnpm install\` (or \`npx pnpm install\`) on their machine before building. Use node_modules freely during your run for builds and tests.`)
-    : '';
-
-  const scheduledNote = params.isScheduledTask
-    ? `You are running as a scheduled task${params.taskId ? ` (task id: ${params.taskId})` : ''}. If you need to communicate, use \`mcp__dotclaw__send_message\`.`
-    : '';
-
-  const fmtPack = (label: string, pack: PromptPack | null | undefined) =>
-    pack ? formatPromptPack({ label, pack, maxDemos: PROMPT_PACKS_MAX_DEMOS, maxChars: PROMPT_PACKS_MAX_CHARS }) : '';
-
-  const PROMPT_PACKS_TOTAL_BUDGET = PROMPT_PACKS_MAX_CHARS * 3;
-  const allPackBlocks: string[] = [];
-  {
-    const packEntries: Array<[string, PromptPack | null | undefined]> = [
-      ['Tool Calling Guidelines', params.toolCallingPack],
-      ['Tool Outcome Guidelines', params.toolOutcomePack],
-      ['Task Extraction Guidelines', params.taskExtractionPack],
-      ['Response Quality Guidelines', params.responseQualityPack],
-      ['Memory Policy Guidelines', params.memoryPolicyPack],
-      ['Memory Recall Guidelines', params.memoryRecallPack],
-    ];
-    let totalChars = 0;
-    for (const [label, pack] of packEntries) {
-      const block = fmtPack(label, pack);
-      if (!block) continue;
-      if (totalChars + block.length > PROMPT_PACKS_TOTAL_BUDGET) break;
-      allPackBlocks.push(block);
-      totalChars += block.length;
-    }
-  }
-  const taskExtractionBlock = allPackBlocks.find(b => b.includes('Task Extraction')) || '';
-  const responseQualityBlock = allPackBlocks.find(b => b.includes('Response Quality')) || '';
-  const toolCallingBlock = allPackBlocks.find(b => b.includes('Tool Calling')) || '';
-  const toolOutcomeBlock = allPackBlocks.find(b => b.includes('Tool Outcome')) || '';
-  const memoryPolicyBlock = allPackBlocks.find(b => b.includes('Memory Policy')) || '';
-  const memoryRecallBlock = allPackBlocks.find(b => b.includes('Memory Recall')) || '';
-
-  const memorySections: string[] = [];
-  {
-    if (hasAnyMemory) {
-      if (memorySummary) {
-        memorySections.push('Long-term memory summary:', memorySummary);
-      }
-      if (memoryFacts) {
-        memorySections.push('Long-term facts:', memoryFacts);
-      }
-      if (userProfile) {
-        memorySections.push('User profile (if available):', userProfile);
-      }
-      if (longTermRecall) {
-        memorySections.push('What you remember about the user (long-term):', longTermRecall);
-      }
-      if (memoryStats) {
-        memorySections.push('Memory stats:', memoryStats);
-      }
-    } else {
-      memorySections.push('No long-term memory available yet.');
-    }
-  }
-
-  // Session recall is always included (local context from current conversation)
-  if (sessionRecall) {
-    memorySections.push('Recent conversation context:', sessionRecall);
-  }
-
-  return [
-    `You are ${params.assistantName}, a personal assistant running inside DotClaw.${params.messagingPlatform ? ` You are currently connected via ${params.messagingPlatform}.` : ''}`,
-    hostPlatformNote,
-    scheduledNote,
-    toolGuidance,
-    browserAutomation,
-    groupNotes,
-    globalNotes,
-    skillNotes,
-    timezoneNote,
-    toolCallingBlock,
-    toolOutcomeBlock,
-    taskExtractionBlock,
-    responseQualityBlock,
-    memoryPolicyBlock,
-    memoryRecallBlock,
-    ...memorySections,
-    availableGroups ? `Available groups (main group only):\n${availableGroups}` : '',
-    toolReliability ? `Tool reliability (recent):\n${toolReliability}` : '',
-    behaviorNotes.length > 0 ? `Behavior notes:\n${behaviorNotes.join('\n')}` : '',
-    params.maxToolSteps
-      ? `You have a budget of ${params.maxToolSteps} tool steps per request. If a task is large, break your work into phases and always finish with a text summary of what you accomplished — never end on a tool call without a response.`
-      : '',
-    'Be concise and helpful. When you use tools, summarize what happened rather than dumping raw output.'
-  ].filter(Boolean).join('\n\n');
+  return buildSystemPrompt({
+    mode: 'full',
+    assistantName: params.assistantName,
+    messagingPlatform: params.messagingPlatform,
+    hostPlatform: params.hostPlatform,
+    timezone: params.timezone,
+    isScheduledTask: params.isScheduledTask,
+    taskId: params.taskId,
+    groupNotes: params.groupNotes,
+    globalNotes: params.globalNotes,
+    skillCatalog: params.skillCatalog,
+    memorySummary: params.memorySummary,
+    memoryFacts: params.memoryFacts,
+    sessionRecall: params.sessionRecall,
+    longTermRecall: params.longTermRecall,
+    userProfile: params.userProfile,
+    memoryStats: params.memoryStats,
+    availableGroups: params.availableGroups,
+    toolReliability: params.toolReliability,
+    behaviorConfig: params.behaviorConfig,
+    taskExtractionPack: params.taskExtractionPack,
+    responseQualityPack: params.responseQualityPack,
+    toolCallingPack: params.toolCallingPack,
+    toolOutcomePack: params.toolOutcomePack,
+    memoryPolicyPack: params.memoryPolicyPack,
+    memoryRecallPack: params.memoryRecallPack,
+    maxToolSteps: params.maxToolSteps,
+    browserEnabled: agentConfig.agent.browser.enabled,
+    promptPacksMaxChars: PROMPT_PACKS_MAX_CHARS,
+    promptPacksMaxDemos: PROMPT_PACKS_MAX_DEMOS,
+  });
 }
 
 function loadAvailableGroups(): Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }> {
@@ -899,14 +799,69 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     log(`Compacting history: ${totalTokens} tokens`);
     archiveConversation(history, sessionCtx.state.summary || null, GROUP_DIR);
 
-    const summaryUpdate = await updateMemorySummary({
-      openrouter,
-      model: summaryModel,
-      existingSummary: sessionCtx.state.summary,
-      existingFacts: sessionCtx.state.facts,
-      newMessages: olderMessages,
-      maxOutputTokens: config.summaryMaxOutputTokens
-    });
+    // Multi-part compaction: split older messages into chunks, summarize each
+    const olderTokens = olderMessages.reduce(
+      (sum, m) => sum + estimateTokens(m.content), 0
+    );
+    const MULTI_PART_THRESHOLD = 40_000; // Use multi-part for large histories
+    const numParts = olderTokens > MULTI_PART_THRESHOLD ? Math.min(3, Math.ceil(olderTokens / MULTI_PART_THRESHOLD)) : 1;
+
+    let summaryUpdate: { summary: string; facts: string[] } | null = null;
+
+    if (numParts > 1) {
+      log(`Multi-part compaction: ${numParts} parts`);
+      const chunks = splitMessagesByTokenShare(olderMessages, numParts);
+      const partSummaries: string[] = [];
+      const mergedFacts: string[] = [...sessionCtx.state.facts];
+
+      for (let i = 0; i < chunks.length; i++) {
+        const partPrompt = buildMultiPartSummaryPrompt(
+          sessionCtx.state.summary,
+          mergedFacts,
+          chunks[i],
+          i,
+          chunks.length,
+          partSummaries
+        );
+        const partResult = openrouter.callModel({
+          model: summaryModel,
+          instructions: partPrompt.instructions,
+          input: partPrompt.input,
+          maxOutputTokens: config.summaryMaxOutputTokens,
+          temperature: 0.1,
+          reasoning: { effort: 'low' as const }
+        });
+        const { text: partText } = await getResponseText(partResult, `summary_part_${i}`);
+        const parsed = parseSummaryResponse(partText);
+        if (parsed) {
+          partSummaries.push(parsed.summary);
+          // Merge facts, deduplicating by content
+          const existingSet = new Set(mergedFacts.map(f => f.toLowerCase()));
+          for (const fact of parsed.facts) {
+            if (!existingSet.has(fact.toLowerCase())) {
+              mergedFacts.push(fact);
+              existingSet.add(fact.toLowerCase());
+            }
+          }
+        }
+      }
+
+      if (partSummaries.length > 0) {
+        summaryUpdate = {
+          summary: partSummaries.join(' '),
+          facts: mergedFacts
+        };
+      }
+    } else {
+      summaryUpdate = await updateMemorySummary({
+        openrouter,
+        model: summaryModel,
+        existingSummary: sessionCtx.state.summary,
+        existingFacts: sessionCtx.state.facts,
+        newMessages: olderMessages,
+        maxOutputTokens: config.summaryMaxOutputTokens
+      });
+    }
 
     if (summaryUpdate) {
       sessionCtx.state.summary = summaryUpdate.summary;
@@ -1008,7 +963,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   if (memoryPolicyResult) promptPackVersions['memory-policy'] = memoryPolicyResult.pack.version;
   if (memoryRecallResult) promptPackVersions['memory-recall'] = memoryRecallResult.pack.version;
 
-  const buildInstructions = () => buildSystemInstructions({
+  const resolveInstructions = () => buildInstructions({
     assistantName,
     groupNotes: claudeNotes.group,
     globalNotes: claudeNotes.global,
@@ -1037,7 +992,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   });
 
   const buildContext = () => {
-    const resolvedInstructions = buildInstructions();
+    const resolvedInstructions = resolveInstructions();
     const resolvedInstructionTokens = estimateTokensForModel(resolvedInstructions, tokenEstimate.tokensPerChar);
     const outputReserve = resolvedMaxOutputTokens || Math.floor(config.maxContextTokens * 0.25);
     const resolvedMaxContext = Math.max(config.maxContextTokens - outputReserve - resolvedInstructionTokens, 2000);
@@ -1094,6 +1049,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     let lastError: unknown = null;
     for (let attempt = 0; attempt < modelChain.length; attempt++) {
       currentModel = modelChain[attempt];
+      // Skip models in cooldown (unless it's the last option)
+      if (isModelInCooldown(currentModel) && attempt < modelChain.length - 1) {
+        log(`Skipping ${currentModel} (in cooldown)`);
+        continue;
+      }
       if (attempt > 0) log(`Fallback ${attempt}: trying ${currentModel}`);
 
       try {
@@ -1157,9 +1117,12 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         break; // Success
       } catch (err) {
         lastError = err;
-        if (classifyError(err) && attempt < modelChain.length - 1) {
-          log(`${currentModel} failed (${classifyError(err)}): ${err instanceof Error ? err.message : err}`);
-          continue;
+        if (classifyError(err)) {
+          cooldownModel(currentModel, err);
+          if (attempt < modelChain.length - 1) {
+            log(`${currentModel} failed (${classifyError(err)}): ${err instanceof Error ? err.message : err}`);
+            continue;
+          }
         }
         throw err; // Non-retryable or last model — propagate
       }
@@ -1189,6 +1152,14 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       latency_ms: latencyMs
     };
+  }
+
+  // Parse reply tags from response before saving to history
+  let replyToId: string | undefined;
+  if (responseText) {
+    const parsed = parseReplyTags(responseText);
+    responseText = parsed.cleanText;
+    replyToId = parsed.replyToId;
   }
 
   appendHistory(sessionCtx, 'assistant', responseText || '');
@@ -1284,7 +1255,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     memory_items_extracted: memoryItemsExtracted,
     timings: Object.keys(timings).length > 0 ? timings : undefined,
     tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-    latency_ms: latencyMs
+    latency_ms: latencyMs,
+    replyToId
   };
 }
 

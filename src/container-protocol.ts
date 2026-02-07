@@ -88,6 +88,8 @@ export interface ContainerOutput {
     output_truncated?: boolean;
   }>;
   latency_ms?: number;
+  /** Reply-to message ID parsed from agent output [[reply_to:<id>]] tags */
+  replyToId?: string;
   /** Set by the host container-runner when stdout was truncated before parsing */
   stdoutTruncated?: boolean;
 }

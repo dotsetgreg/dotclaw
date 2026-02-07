@@ -22,11 +22,17 @@
     "routing": {
       "model": "moonshotai/kimi-k2.5",
       "fallbacks": ["anthropic/claude-sonnet-4-5", "openai/gpt-4.1"],
+      "allowedModels": [],
       "maxOutputTokens": 0,
       "maxToolSteps": 200,
       "temperature": 0.2,
       "recallMaxResults": 8,
       "recallMaxTokens": 1500
+    },
+    "webhook": {
+      "enabled": false,
+      "port": 3003,
+      "token": ""
     },
     "streaming": {
       "enabled": true,
@@ -53,7 +59,24 @@
     "tools": {
       "enableBash": true,
       "enableWebSearch": true,
-      "enableWebFetch": true
+      "enableWebFetch": true,
+      "bash": {
+        "timeoutMs": 600000
+      },
+      "process": {
+        "maxSessions": 16,
+        "maxOutputBytes": 1048576,
+        "defaultTimeoutMs": 1800000
+      }
+    },
+    "tts": {
+      "provider": "edge-tts",
+      "openaiModel": "tts-1",
+      "openaiVoice": "alloy"
+    },
+    "mcp": {
+      "enabled": true,
+      "servers": []
     }
   }
 }
