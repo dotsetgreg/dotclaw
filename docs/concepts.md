@@ -67,7 +67,7 @@ When the primary model fails (rate limit, outage, timeout), DotClaw automaticall
 
 ## Configurable reasoning
 
-Control how much internal reasoning the model uses via `agent.reasoning.effort`: `off`, `low`, `medium`, or `high`. Higher effort produces better answers on complex questions but uses more tokens. Default is `low`. Summary and memory extraction calls always use `low` regardless of this setting.
+Control how much internal reasoning the model uses via `agent.reasoning.effort`: `off`, `low`, `medium`, or `high`. Higher effort produces better answers on complex questions but uses more tokens. Default is `medium`. Summary and memory extraction calls always use `low` regardless of this setting.
 
 ## Image and vision
 

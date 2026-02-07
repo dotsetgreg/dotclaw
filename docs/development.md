@@ -8,7 +8,10 @@ title: Development
 
 ```bash
 npm run dev          # Run with hot reload (tsx watch)
+npm run dev:up       # Full dev cycle: rebuild container + kill stale daemons + start dev
+npm run dev:down     # Remove all running dotclaw agent containers
 npm run build        # Compile TypeScript (host)
+npm run build:all    # Build both host and container
 npm run typecheck    # Type-check without emitting
 npm run lint         # Run ESLint
 npm test             # Build + Node tests + agent runner test

@@ -14,13 +14,16 @@ npm start
 ## Development mode
 
 ```bash
-npm run dev
+npm run dev          # Run with hot reload
+npm run dev:up       # Full dev cycle: rebuild container + kill stale daemons + start dev
+npm run dev:down     # Remove all running dotclaw agent containers
 ```
 
 ## Build the agent container
 
 ```bash
-./container/build.sh
+dotclaw build        # Or: ./container/build.sh
+npm run build:all    # Build both host and container
 ```
 
 ## Logs

@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress';
 
 export default defineConfig({
   title: 'DotClaw',
-  description: 'Personal OpenRouter-based assistant for Telegram with container isolation, memory, and scheduling.',
+  description: 'Personal OpenRouter-based assistant for Telegram and Discord with container isolation, memory, and scheduling.',
   lang: 'en-US',
   base: '/dotclaw/',
   lastUpdated: true,
@@ -21,7 +21,10 @@ export default defineConfig({
           items: [
             { text: 'Requirements', link: '/getting-started/requirements' },
             { text: 'Quickstart', link: '/getting-started/quickstart' },
-            { text: 'Manual Setup', link: '/getting-started/manual-setup' }
+            { text: 'Manual Setup', link: '/getting-started/manual-setup' },
+            { text: 'Telegram Setup', link: '/getting-started/telegram-setup' },
+            { text: 'Discord Setup', link: '/getting-started/discord-setup' },
+            { text: 'Multi-Provider Setup', link: '/getting-started/multi-provider' }
           ]
         }
       ],
@@ -34,7 +37,8 @@ export default defineConfig({
             { text: 'Runtime Config', link: '/configuration/runtime' },
             { text: 'Model Selection', link: '/configuration/model' },
             { text: 'Behavior Config', link: '/configuration/behavior' },
-            { text: 'Tools, Budgets, Plugins', link: '/configuration/tools' }
+            { text: 'Tools, Budgets, Plugins', link: '/configuration/tools' },
+            { text: 'Triggers and Mentions', link: '/configuration/triggers' }
           ]
         }
       ],
