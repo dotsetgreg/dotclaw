@@ -315,7 +315,7 @@ These are fallback defaults. When model capabilities are available (fetched from
 |---------|---------|-------------|
 | `maxContextTokens` | `128000` | Maximum context window tokens (auto-derived from model capabilities) |
 | `compactionTriggerTokens` | `120000` | Token count that triggers context compaction (auto-derived) |
-| `recentContextTokens` | `0` (auto) | Tokens reserved for recent conversation history. `0` = auto (60% of the model's context window, e.g. ~77K on a 128K model). Set an explicit value to override. |
+| `recentContextTokens` | `0` (auto) | Tokens reserved for recent conversation history. `0` = auto (35% of the model's context window, e.g. ~92K on a 262K model). Set an explicit value to override. |
 | `summaryUpdateEveryMessages` | `20` | Messages between summary updates |
 | `maxOutputTokens` | `8192` | Default max output tokens |
 | `summaryMaxOutputTokens` | `2048` | Max tokens for summary generation |

@@ -13,6 +13,7 @@ import type { AgentContext } from './agent-context.js';
 import type { ContainerOutput } from './container-protocol.js';
 import { logger } from './logger.js';
 import { emitHook } from './hooks.js';
+import { humanizeError } from './error-messages.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -98,7 +99,7 @@ function buildTaskNotificationMessage(params: {
     ? `Retrying (attempt ${params.retryCount}).`
     : null;
   const body = params.error
-    ? summarizeTaskText(params.error, 2000)
+    ? humanizeError(params.error)
     : (summarizeTaskText(params.result, 3000) || 'Done.');
   return [
     `Your task ${taskLabel} ${statusLabel}.`,

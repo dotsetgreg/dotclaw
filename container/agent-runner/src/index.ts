@@ -144,9 +144,10 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-function classifyError(err: unknown): 'retryable' | null {
+function classifyError(err: unknown): 'retryable' | 'context_overflow' | null {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
+  if (/maximum context length|context.?length.?exceeded|too many tokens/i.test(msg)) return 'context_overflow';
   if (/429|rate.?limit/.test(lower)) return 'retryable';
   if (/\b5\d{2}\b/.test(msg) || /server error|bad gateway|unavailable/.test(lower)) return 'retryable';
   if (/timeout|timed out|deadline/.test(lower)) return 'retryable';
@@ -848,10 +849,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     history = limitHistoryTurns(history, agent.context.maxHistoryTurns);
   }
 
-  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate 60% of context window
+  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate remaining context
+  // after subtracting reserves for system prompt (25%), output (25%), tools (~3%), and safety (12%)
   const effectiveRecentTokens = config.recentContextTokens > 0
     ? config.recentContextTokens
-    : Math.floor(config.maxContextTokens * 0.6);
+    : Math.floor(config.maxContextTokens * 0.35);
   const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
   const adjustedRecentTokens = Math.max(1000, Math.floor(effectiveRecentTokens * tokenRatio));
 
@@ -1104,7 +1106,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
       + tokenEstimate.tokensPerRequest;
 
-    const safeLimit = Math.floor(config.maxContextTokens * 0.9);
+    // Safety margin: use 65% of context to account for tool schema tokens (~6K)
+    // and token estimation inaccuracy (estimateTokensForModel can undercount by 30-40%)
+    const safeLimit = Math.floor(config.maxContextTokens * 0.65);
     if (resolvedPromptTokens > safeLimit && contextMessages.length > 2) {
       log(`Estimated ${resolvedPromptTokens} tokens exceeds safe limit ${safeLimit}, truncating`);
       while (contextMessages.length > 2) {
@@ -1261,6 +1265,27 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
           // original messages + model output + tool results (accumulated each round)
           conversationInput = [...conversationInput, ...lastResponse.output, ...toolResults];
 
+          // Cap follow-up context to prevent context overflow during tool loops.
+          // Tool results (especially memory_list, web_fetch) can be huge.
+          // Use 60% of context as the hard cap for follow-up input, leaving room for
+          // system prompt (~25%), tool schemas (~3%), and output.
+          const followupTokenLimit = Math.floor(config.maxContextTokens * 0.6);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const estimateInputTokens = (items: any[]) => items.reduce((sum: number, item: any) => {
+            const content = typeof item === 'string' ? item : JSON.stringify(item);
+            return sum + estimateTokensForModel(content, tokenEstimate.tokensPerChar);
+          }, 0);
+          let followupInputTokens = estimateInputTokens(conversationInput);
+          if (followupInputTokens > followupTokenLimit && conversationInput.length > 4) {
+            log(`Tool loop context ${followupInputTokens} tokens exceeds limit ${followupTokenLimit}, trimming oldest messages`);
+            // Remove oldest entries (keep at least last 4: recent user msg + tool call + tool result + margin)
+            while (conversationInput.length > 4 && followupInputTokens > followupTokenLimit) {
+              conversationInput.splice(0, 1);
+              followupInputTokens = estimateInputTokens(conversationInput);
+            }
+            log(`Trimmed to ${followupInputTokens} tokens (${conversationInput.length} items)`);
+          }
+
           // Follow-up call with complete context — model sees the full conversation
           const followupResult = openrouter.callModel({
             model: currentModel,
@@ -1276,6 +1301,34 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             lastResponse = await followupResult.getResponse();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
+            // Context overflow in tool loop: trim and retry once before giving up
+            if (classifyError(err) === 'context_overflow' && conversationInput.length > 4) {
+              log(`Context overflow in tool loop at step ${step}, trimming 50% of context`);
+              const trimCount = Math.floor(conversationInput.length / 2);
+              conversationInput.splice(0, trimCount);
+              try {
+                const retryResult = openrouter.callModel({
+                  model: currentModel,
+                  instructions: resolvedInstructions,
+                  input: conversationInput,
+                  tools: schemaTools,
+                  maxOutputTokens: resolvedMaxOutputTokens,
+                  temperature: config.temperature,
+                  reasoning: resolvedReasoning
+                });
+                lastResponse = await retryResult.getResponse();
+                const retryText = extractTextFromApiResponse(lastResponse);
+                if (retryText) {
+                  responseText = retryText;
+                  writeStreamChunk(retryText);
+                }
+                pendingCalls = extractFunctionCalls(lastResponse);
+                continue;
+              } catch (retryErr) {
+                log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+                break;
+              }
+            }
             log(`Follow-up getResponse failed at step ${step}: ${message}`);
             break;
           }
@@ -1306,10 +1359,37 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         break; // Success
       } catch (err) {
         lastError = err;
-        if (classifyError(err)) {
+        const errClass = classifyError(err);
+        // Context overflow: don't try fallback models (same context = same problem).
+        // Truncate messages and retry the same model once.
+        if (errClass === 'context_overflow' && contextMessages.length > 4) {
+          log(`Context overflow on ${currentModel}, truncating 50% of messages and retrying`);
+          const trimCount = Math.floor(contextMessages.length / 2);
+          contextMessages.splice(0, trimCount);
+          const trimmedInput = messagesToOpenRouter(contextMessages);
+          try {
+            const retryResult = openrouter.callModel({
+              model: currentModel,
+              instructions: resolvedInstructions,
+              input: trimmedInput,
+              tools: schemaTools,
+              maxOutputTokens: resolvedMaxOutputTokens,
+              temperature: config.temperature,
+              reasoning: resolvedReasoning
+            });
+            const retryResponse = await retryResult.getResponse();
+            responseText = extractTextFromApiResponse(retryResponse) || '';
+            lastError = null;
+            break;
+          } catch (retryErr) {
+            log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+            throw retryErr;
+          }
+        }
+        if (errClass) {
           cooldownModel(currentModel, err);
           if (attempt < modelChain.length - 1) {
-            log(`${currentModel} failed (${classifyError(err)}): ${err instanceof Error ? err.message : err}`);
+            log(`${currentModel} failed (${errClass}): ${err instanceof Error ? err.message : err}`);
             continue;
           }
         }
