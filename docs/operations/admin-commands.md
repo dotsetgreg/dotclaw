@@ -12,7 +12,7 @@ Admin commands are available via `/dotclaw` (or the shorthand `/dc`). Group mana
 - `/dotclaw groups` (main only)
 - `/dotclaw add-group <chat_id> <name> [folder]` (main only)
 - `/dotclaw remove-group <chat_id|name|folder>` (main only)
-- `/dotclaw set-model <model> [global|group|user] [target_id]` (main only)
+- `/dotclaw set-model <model> [global|group|user] [target_id]` (main only) — also accepts `/dotclaw set model` and `/dotclaw model <model>` (global shorthand)
 - `/dotclaw remember <fact>` (main only)
 - `/dotclaw style <concise|balanced|detailed>`
 - `/dotclaw tools <conservative|balanced|proactive>`

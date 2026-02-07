@@ -28,7 +28,7 @@ title: Runtime Config
       "fallbacks": [],
       "maxOutputTokens": 0,
       "maxToolSteps": 200,
-      "temperature": 0.2
+      "temperature": 0.6
     }
   },
   "agent": {
@@ -148,6 +148,7 @@ title: Runtime Config
 |---------|---------|-------------|
 | `maxResults` | `8` | Maximum memory items returned per recall query |
 | `maxTokens` | `1000` | Maximum tokens for recalled memory content |
+| `minScore` | `0.35` | Minimum relevance score threshold (0-1) for memory recall |
 
 #### `host.memory.embeddings`
 
@@ -259,7 +260,7 @@ title: Runtime Config
 | `fallbacks` | `[]` | Fallback models tried in order when the primary model fails (e.g. rate limit, outage) |
 | `maxOutputTokens` | `0` | Maximum output tokens per response. `0` = auto (use model's native limit from OpenRouter API, cached 24h) |
 | `maxToolSteps` | `200` | Maximum tool-call steps per request |
-| `temperature` | `0.2` | Sampling temperature |
+| `temperature` | `0.6` | Sampling temperature |
 | `recallMaxResults` | `8` | Maximum memory items returned per recall query |
 | `recallMaxTokens` | `1500` | Maximum tokens for recalled memory content |
 
@@ -288,7 +289,7 @@ title: Runtime Config
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `effort` | `"low"` | Reasoning effort for the primary model: `off`, `low`, `medium`, `high`. Higher effort uses more reasoning tokens for better quality on complex questions. Summary and memory calls always use `low`. |
+| `effort` | `"medium"` | Reasoning effort for the primary model: `off`, `low`, `medium`, `high`. Higher effort uses more reasoning tokens for better quality on complex questions. Summary and memory calls always use `low`. |
 
 ### `agent.skills`
 
@@ -316,10 +317,15 @@ These are fallback defaults. When model capabilities are available (fetched from
 | `compactionTriggerTokens` | `120000` | Token count that triggers context compaction (auto-derived) |
 | `recentContextTokens` | `8000` | Tokens reserved for recent messages |
 | `summaryUpdateEveryMessages` | `20` | Messages between summary updates |
-| `maxOutputTokens` | `1024` | Default max output tokens (for summary/memory calls) |
+| `maxOutputTokens` | `8192` | Default max output tokens |
 | `summaryMaxOutputTokens` | `2048` | Max tokens for summary generation |
-| `temperature` | `0.2` | Default temperature |
+| `temperature` | `0.6` | Default temperature |
 | `maxContextMessageTokens` | `4000` | Max tokens per individual message (auto-derived) |
+| `maxHistoryTurns` | `40` | Maximum conversation history messages to include |
+| `contextPruning.softTrimMaxChars` | `4000` | Maximum characters before soft-trimming old assistant messages |
+| `contextPruning.softTrimHeadChars` | `1500` | Characters to keep from the start when trimming |
+| `contextPruning.softTrimTailChars` | `1500` | Characters to keep from the end when trimming |
+| `contextPruning.keepLastAssistant` | `3` | Number of recent assistant messages to protect from trimming |
 
 ### `agent.memory`
 
@@ -373,7 +379,7 @@ Sub-models used for auxiliary tasks:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `timeoutMs` | `120000` (2m) | Bash command timeout |
+| `timeoutMs` | `600000` (10m) | Bash command timeout |
 | `outputLimitBytes` | `200000` | Maximum Bash output size |
 
 #### `agent.tools.plugin`
@@ -408,6 +414,9 @@ Sub-models used for auxiliary tasks:
 | `enabled` | `true` | Enable agent-side TTS |
 | `model` | `"edge-tts"` | TTS engine |
 | `defaultVoice` | `"en-US-AriaNeural"` | Default voice |
+| `provider` | `"edge-tts"` | TTS provider: `edge-tts` or `openai` |
+| `openaiModel` | `"tts-1"` | OpenAI TTS model (when provider is `openai`) |
+| `openaiVoice` | `"alloy"` | OpenAI voice name (when provider is `openai`) |
 
 ### `agent.browser`
 
@@ -421,7 +430,7 @@ Sub-models used for auxiliary tasks:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `false` | Enable MCP server connections |
+| `enabled` | `true` | Enable MCP server connections |
 | `connectionTimeoutMs` | `10000` | Connection timeout |
 | `servers` | `[]` | Array of MCP server configs |
 
@@ -436,6 +445,14 @@ Each server entry:
   "env": { "API_KEY": "..." }
 }
 ```
+
+### `agent.process`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `maxSessions` | `16` | Maximum concurrent process sessions |
+| `maxOutputBytes` | `1048576` (1 MB) | Maximum output size per process |
+| `defaultTimeoutMs` | `1800000` (30m) | Default timeout for process sessions |
 
 ### `agent.ipc`
 
