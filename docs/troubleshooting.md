@@ -57,6 +57,18 @@ If you need reduced container privileges, set:
 
 Then restart DotClaw.
 
+For deterministic release gating on the production machine, run:
+
+```bash
+npm run preflight:prod-chat -- \
+  --chat discord:1469421941294108713 \
+  --dotclaw-home ~/.dotclaw \
+  --timeout-sec 180 \
+  --require-completed 1
+```
+
+The command exits `0` only when the target chat has a completed queue row (and trace by default) after `--start-iso`/start time, and exits non-zero on failed/stale/timeout conditions.
+
 ## Diagnostics
 
 Run the doctor script to inspect common issues:
@@ -72,3 +84,39 @@ Confirm `host.timezone` (or `TZ`) in `~/.dotclaw/config/runtime.json` and restar
 ```bash
 dotclaw restart
 ```
+
+## Message stays on typing with no model request
+
+If logs stop after `Processing message` (often around embedding/memory recall) and no provider request is emitted, DotClaw is likely blocked in recall prep.
+
+Mitigations:
+
+- reduce recall wait ceiling:
+
+```json
+{
+  "host": {
+    "memory": {
+      "recall": {
+        "timeoutMs": 5000
+      }
+    }
+  }
+}
+```
+
+- temporarily disable semantic embeddings:
+
+```json
+{
+  "host": {
+    "memory": {
+      "embeddings": {
+        "enabled": false
+      }
+    }
+  }
+}
+```
+
+Then restart DotClaw.
