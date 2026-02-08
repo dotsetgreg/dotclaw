@@ -158,21 +158,121 @@ export function appendHistory(ctx: SessionContext, role: 'user' | 'assistant', c
   return message;
 }
 
+function safeStringifyHistoryValue(value: unknown): string {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === 'string' ? serialized : String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function coerceHistoryContentToString(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((part) => {
+        if (!part || typeof part !== 'object') return null;
+        const record = part as Record<string, unknown>;
+        if (typeof record.text === 'string' && record.text.trim()) return record.text;
+        if (typeof record.content === 'string' && record.content.trim()) return record.content;
+        if (typeof record.output === 'string' && record.output.trim()) return record.output;
+        if (typeof record.refusal === 'string' && record.refusal.trim()) return record.refusal;
+        return null;
+      })
+      .filter((part): part is string => typeof part === 'string');
+    if (parts.length > 0) return parts.join('\n');
+    return safeStringifyHistoryValue(value);
+  }
+
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (typeof record.text === 'string' && record.text.trim()) return record.text;
+    if (typeof record.content === 'string' && record.content.trim()) return record.content;
+    if (typeof record.output === 'string' && record.output.trim()) return record.output;
+    if (typeof record.refusal === 'string' && record.refusal.trim()) return record.refusal;
+    return safeStringifyHistoryValue(value);
+  }
+
+  return String(value);
+}
+
 export function loadHistory(ctx: SessionContext): Message[] {
   if (!fs.existsSync(ctx.historyPath)) return [];
-  const lines = fs.readFileSync(ctx.historyPath, 'utf-8').trim().split('\n');
+  const raw = fs.readFileSync(ctx.historyPath, 'utf-8');
+  if (!raw.trim()) return [];
+  const lines = raw.trim().split('\n');
   const messages: Message[] = [];
+  let needsRewrite = false;
+  let highestSeq = 0;
   for (const line of lines) {
-    if (!line.trim()) continue;
+    if (!line.trim()) {
+      needsRewrite = true;
+      continue;
+    }
     try {
-      const parsed = JSON.parse(line);
-      if (parsed?.role && parsed?.content) {
-        messages.push(parsed);
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      const role = parsed?.role === 'user' || parsed?.role === 'assistant'
+        ? parsed.role
+        : null;
+      if (!role) {
+        needsRewrite = true;
+        continue;
       }
+
+      const content = coerceHistoryContentToString(parsed.content);
+      if (typeof parsed.content !== 'string') {
+        needsRewrite = true;
+      }
+
+      const timestamp = typeof parsed.timestamp === 'string' && parsed.timestamp
+        ? parsed.timestamp
+        : new Date().toISOString();
+      if (timestamp !== parsed.timestamp) {
+        needsRewrite = true;
+      }
+
+      const parsedSeq = Number(parsed.seq);
+      const seq = Number.isFinite(parsedSeq) && parsedSeq > 0
+        ? Math.floor(parsedSeq)
+        : (highestSeq + 1);
+      if (seq !== parsedSeq) {
+        needsRewrite = true;
+      }
+      highestSeq = Math.max(highestSeq, seq);
+
+      messages.push({
+        role,
+        content,
+        timestamp,
+        seq
+      });
     } catch {
-      // ignore malformed lines
+      needsRewrite = true;
     }
   }
+
+  messages.sort((a, b) => a.seq - b.seq);
+  let nextSeq = 1;
+  for (const message of messages) {
+    if (message.seq < nextSeq) {
+      message.seq = nextSeq;
+      needsRewrite = true;
+    }
+    nextSeq = message.seq + 1;
+  }
+
+  if (ctx.meta.nextSeq < nextSeq) {
+    ctx.meta.nextSeq = nextSeq;
+    saveSessionMeta(ctx);
+  }
+
+  if (needsRewrite) {
+    writeHistory(ctx, messages);
+  }
+
   return messages;
 }
 

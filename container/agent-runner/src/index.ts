@@ -54,6 +54,10 @@ import {
   loadImageAttachmentsForInput,
   messagesToOpenRouterInput,
 } from './openrouter-input.js';
+import {
+  extractFunctionCallsForReplay,
+  toReplayFunctionCallItems,
+} from './openrouter-followup.js';
 
 type OpenRouterResult = ReturnType<OpenRouter['callModel']>;
 
@@ -206,21 +210,6 @@ function extractTextFromApiResponse(response: any): string {
     }
   }
   return '';
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractFunctionCalls(response: any): Array<{ id: string; name: string; arguments: any }> {
-  const calls: Array<{ id: string; name: string; arguments: unknown }> = [];
-  for (const item of response?.output || []) {
-    if (item?.type === 'function_call') {
-      let args = item.arguments;
-      if (typeof args === 'string') {
-        try { args = JSON.parse(args); } catch { /* keep as string */ }
-      }
-      calls.push({ id: item.callId, name: item.name, arguments: args });
-    }
-  }
-  return calls;
 }
 
 function writeOutput(output: ContainerOutput): void {
@@ -1311,7 +1300,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         }
 
         responseText = extractTextFromApiResponse(lastResponse);
-        let pendingCalls = extractFunctionCalls(lastResponse);
+        let pendingCalls = extractFunctionCallsForReplay(lastResponse);
         const callSignatureCounts = new Map<string, number>();
         let previousRoundSignature = '';
         let repeatedRoundCount = 0;
@@ -1430,8 +1419,10 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             reason: nudgeReason,
             attempt: toolRequirementNudgeAttempt
           });
-          const responseItems = Array.isArray(lastResponse?.output) ? lastResponse.output : [];
-          conversationInput = [...conversationInput, ...responseItems, { role: 'user', content: nudgePrompt }];
+          if (responseText) {
+            conversationInput = [...conversationInput, { role: 'assistant', content: responseText }];
+          }
+          conversationInput = [...conversationInput, { role: 'user', content: nudgePrompt }];
           try {
             const nudgeResult = openrouter.callModel({
               model: currentModel,
@@ -1448,7 +1439,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
               responseText = nudgeText;
               writeStreamChunk(nudgeText);
             }
-            pendingCalls = extractFunctionCalls(lastResponse);
+            pendingCalls = extractFunctionCallsForReplay(lastResponse);
           } catch (nudgeErr) {
             log(`Tool requirement nudge failed: ${nudgeErr instanceof Error ? nudgeErr.message : String(nudgeErr)}`);
             break;
@@ -1588,7 +1579,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
           // Build follow-up input with FULL conversation context:
           // original messages + model output + tool results (accumulated each round)
-          conversationInput = [...conversationInput, ...lastResponse.output, ...toolResults];
+          const replayFunctionCalls = toReplayFunctionCallItems(pendingCalls);
+          conversationInput = [...conversationInput, ...replayFunctionCalls, ...toolResults];
 
           // Compact oversized tool payloads before follow-up calls to reduce context bloat.
           const compactedConversation = compactToolConversationItems(conversationInput, {
@@ -1695,7 +1687,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
                     responseText = retryText;
                     writeStreamChunk(retryText);
                   }
-                  pendingCalls = extractFunctionCalls(lastResponse);
+                  pendingCalls = extractFunctionCallsForReplay(lastResponse);
                   continue;
                 } catch (retryErr) {
                   log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
@@ -1715,7 +1707,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             writeStreamChunk(followupText);
           }
 
-          pendingCalls = extractFunctionCalls(lastResponse);
+          pendingCalls = extractFunctionCallsForReplay(lastResponse);
         }
 
         if (toolExecutionRequirement.required && toolCalls.length === 0) {
