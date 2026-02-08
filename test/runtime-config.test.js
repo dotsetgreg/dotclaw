@@ -73,7 +73,7 @@ test('validation clamps invalid negative timeouts to safe defaults', async () =>
       maintenance: { intervalMs: -1 },
       messageQueue: { promptMaxChars: -50 },
       routing: { hostFailover: { maxRetries: -1 } },
-      memory: { backend: { strategy: 'invalid' } }
+      memory: { recall: { timeoutMs: -1 }, backend: { strategy: 'invalid' } }
     },
     agent: {
       tools: {
@@ -101,6 +101,7 @@ test('validation clamps invalid negative timeouts to safe defaults', async () =>
     assert.ok(config.host.maintenance.intervalMs >= 60000, 'maintenance intervalMs should be clamped to >= 60000');
     assert.ok(config.host.messageQueue.promptMaxChars >= 2000, 'promptMaxChars should be clamped to >= 2000');
     assert.ok(config.host.routing.hostFailover.maxRetries >= 0, 'host failover maxRetries should be clamped to >= 0');
+    assert.ok(config.host.memory.recall.timeoutMs >= 100, 'memory recall timeoutMs should be clamped to >= 100');
     assert.equal(config.host.memory.backend.strategy, 'builtin', 'invalid memory backend strategy should default to builtin');
     assert.ok(config.agent.tools.completionGuard.idempotentRetryAttempts >= 1, 'idempotentRetryAttempts should be clamped to >= 1');
     assert.ok(config.agent.tools.completionGuard.idempotentRetryBackoffMs >= 0, 'idempotentRetryBackoffMs should be clamped to >= 0');
@@ -144,6 +145,7 @@ test('default routing maxOutputTokens is 0 (auto) and maxToolSteps is 200', asyn
     assert.equal(config.host.messageQueue.promptMaxChars, 24000, 'promptMaxChars should default to 24000');
     assert.equal(config.host.routing.hostFailover.enabled, true, 'host failover should default to enabled');
     assert.equal(config.host.routing.hostFailover.maxRetries, 1, 'host failover maxRetries should default to 1');
+    assert.equal(config.host.memory.recall.timeoutMs, 15000, 'memory recall timeoutMs should default to 15000');
     assert.equal(config.host.memory.backend.strategy, 'builtin', 'memory backend should default to builtin');
     assert.equal(config.agent.tools.completionGuard.idempotentRetryAttempts, 2, 'idempotentRetryAttempts should default to 2');
     assert.equal(config.agent.tools.completionGuard.repeatedSignatureThreshold, 3, 'repeatedSignatureThreshold should default to 3');

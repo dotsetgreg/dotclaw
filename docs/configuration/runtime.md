@@ -169,6 +169,7 @@ title: Runtime Config
 | `maxResults` | `8` | Maximum memory items returned per recall query |
 | `maxTokens` | `1000` | Maximum tokens for recalled memory content |
 | `minScore` | `0.35` | Minimum relevance score threshold (0-1) for memory recall |
+| `timeoutMs` | `15000` | Maximum time for a single recall attempt before fail-open (continue without recall) |
 
 #### `host.memory.embeddings`
 

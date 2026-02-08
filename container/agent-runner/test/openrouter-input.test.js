@@ -9,6 +9,7 @@ import {
   injectImagesIntoContextInput,
   loadImageAttachmentsForInput,
   messagesToOpenRouterInput,
+  sanitizeConversationInputForResponses,
 } from '../dist/openrouter-input.js';
 
 function makeTempImage(name, contents = 'image-binary-data') {
@@ -123,4 +124,59 @@ test('loadImageAttachmentsForInput ignores non-photo media types safely', () => 
     { type: 'voice', path: '/tmp/voice.ogg', mime_type: 'audio/ogg' }
   ]);
   assert.deepEqual(parts, []);
+});
+
+test('sanitizeConversationInputForResponses normalizes nested multimodal content and tool items', () => {
+  const rawInput = [
+    {
+      role: 'user',
+      content: [
+        [{ type: 'text', text: 'please inspect this image' }],
+        [{ type: 'image_url', image_url: { url: 'data:image/png;base64,abc123' } }]
+      ]
+    },
+    {
+      role: 'assistant',
+      content: [
+        [{ type: 'output_text', text: 'legacy assistant output' }],
+        [{ type: 'refusal', refusal: 'legacy refusal text' }]
+      ]
+    },
+    {
+      type: 'function_call',
+      id: 'call-1',
+      name: 'Read',
+      arguments: { path: 'README.md' }
+    },
+    {
+      type: 'function_call_output',
+      callId: 'call-1',
+      output: { ok: true }
+    }
+  ];
+
+  const sanitized = sanitizeConversationInputForResponses(rawInput);
+
+  assert.equal(sanitized.droppedCount, 0);
+  assert.ok(sanitized.rewrittenCount >= 3);
+
+  assert.equal(sanitized.items[0].role, 'user');
+  assert.ok(Array.isArray(sanitized.items[0].content));
+  assert.equal(sanitized.items[0].content[0].type, 'input_text');
+  assert.equal(sanitized.items[0].content[1].type, 'input_image');
+  assert.equal(sanitized.items[0].content[1].detail, 'auto');
+  assert.equal(sanitized.items[0].content[1].imageUrl, 'data:image/png;base64,abc123');
+
+  assert.equal(sanitized.items[1].role, 'assistant');
+  assert.equal(
+    sanitized.items[1].content,
+    'legacy assistant output\nlegacy refusal text'
+  );
+
+  assert.equal(sanitized.items[2].type, 'function_call');
+  assert.equal(sanitized.items[2].callId, 'call-1');
+  assert.equal(sanitized.items[2].arguments, '{"path":"README.md"}');
+
+  assert.equal(sanitized.items[3].type, 'function_call_output');
+  assert.equal(sanitized.items[3].output, '{"ok":true}');
 });

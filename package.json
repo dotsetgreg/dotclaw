@@ -1,6 +1,6 @@
 {
   "name": "@dotsetlabs/dotclaw",
-  "version": "2.6.1",
+  "version": "2.6.2",
   "description": "Personal OpenRouter-based assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
@@ -40,6 +40,7 @@
     "scripts/canary-suite.js",
     "scripts/run-live-canary.js",
     "scripts/release-slo-check.js",
+    "scripts/preflight-prod-chat.js",
     "scripts/install.sh",
     "config-examples",
     "launchd",
@@ -67,6 +68,7 @@
     "bench:traffic": "node scripts/generate-controlled-traces.js",
     "canary": "node scripts/canary-suite.js",
     "canary:live": "node scripts/run-live-canary.js",
+    "preflight:prod-chat": "node scripts/preflight-prod-chat.js",
     "release:slo": "node scripts/release-slo-check.js",
     "lint": "eslint . --max-warnings=0",
     "test": "npm run build && node --test test/**/*.test.js && npm run test:agent-runner",

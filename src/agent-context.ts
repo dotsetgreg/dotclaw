@@ -6,6 +6,7 @@ import { getToolReliability } from './db.js';
 import { resolveModel, loadModelRegistry, getTokenEstimateConfig, getModelPricing, getModelCapabilities, ModelCapabilities } from './model-registry.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { optimizeRecallQuery, resolveRecallBudget, shouldRunMemoryRecall } from './recall-policy.js';
+import { logger } from './logger.js';
 
 export type AgentContext = {
   memoryRecall: string[];
@@ -53,6 +54,31 @@ function calculateMemoryBudget(
   );
 }
 
+function withTimeout<T>(task: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new Error(timeoutMessage));
+    }, Math.max(1, timeoutMs));
+
+    task.then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 export function applyToolAllowOverride(policy: ToolPolicy, toolAllow?: string[]): ToolPolicy {
   if (!Array.isArray(toolAllow) || toolAllow.length === 0) return policy;
 
@@ -97,6 +123,7 @@ export async function buildAgentContext(params: {
   });
   const tokenEstimate = getTokenEstimateConfig(resolvedModel.override);
   const modelPricing = getModelPricing(modelRegistry, resolvedModel.model);
+  const recallTimeoutMs = Math.max(100, Math.floor(runtime.host.memory.recall.timeoutMs || 15_000));
 
   // Get model capabilities (auto-detected from OpenRouter or defaults)
   const modelCapabilities = await getModelCapabilities(resolvedModel.model);
@@ -122,14 +149,29 @@ export async function buildAgentContext(params: {
     && shouldRunMemoryRecall(optimizedRecallQuery);
   if (recallEnabled) {
     const recallStart = Date.now();
-    memoryRecall = await memoryBackend.buildRecall({
-      groupFolder: params.groupFolder,
-      userId: params.userId ?? null,
-      query: optimizedRecallQuery,
-      maxResults: recallBudget.maxResults,
-      maxTokens: Math.min(dynamicMemoryBudget, recallBudget.maxTokens),
-      minScore: runtime.host.memory.recall.minScore
-    });
+    try {
+      memoryRecall = await withTimeout(
+        memoryBackend.buildRecall({
+          groupFolder: params.groupFolder,
+          userId: params.userId ?? null,
+          query: optimizedRecallQuery,
+          maxResults: recallBudget.maxResults,
+          maxTokens: Math.min(dynamicMemoryBudget, recallBudget.maxTokens),
+          minScore: runtime.host.memory.recall.minScore
+        }),
+        recallTimeoutMs,
+        `Memory recall timed out after ${recallTimeoutMs}ms`
+      );
+    } catch (err) {
+      logger.warn({
+        groupFolder: params.groupFolder,
+        userId: params.userId ?? undefined,
+        recallTimeoutMs,
+        queryChars: optimizedRecallQuery.length,
+        error: err instanceof Error ? err.message : String(err)
+      }, 'Memory recall failed; continuing without recall');
+      memoryRecall = [];
+    }
     memoryRecallMs = Date.now() - recallStart;
   }
 

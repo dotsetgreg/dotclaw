@@ -25,7 +25,8 @@
     },
     "memory": {
       "recall": {
-        "minScore": 0.35
+        "minScore": 0.35,
+        "timeoutMs": 15000
       },
       "embeddings": {
         "enabled": true

@@ -84,6 +84,7 @@ export type RuntimeConfig = {
         maxResults: number;
         maxTokens: number;
         minScore: number;
+        timeoutMs: number;
       };
       embeddings: {
         enabled: boolean;
@@ -434,7 +435,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       recall: {
         maxResults: 8,
         maxTokens: 1000,
-        minScore: 0.35
+        minScore: 0.35,
+        timeoutMs: 15_000
       },
       embeddings: {
         enabled: true,
@@ -748,6 +750,7 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   if (typeof h.memory.recall.minScore === 'number') {
     h.memory.recall.minScore = Math.min(1, Math.max(0, h.memory.recall.minScore));
   }
+  h.memory.recall.timeoutMs = clampMin(h.memory.recall.timeoutMs, 100, 'host.memory.recall.timeoutMs');
   if (h.memory.backend.strategy !== 'builtin' && h.memory.backend.strategy !== 'module') {
     console.warn(`[runtime-config] host.memory.backend.strategy = "${h.memory.backend.strategy}" is invalid, defaulting to "builtin"`);
     h.memory.backend.strategy = 'builtin';
